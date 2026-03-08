@@ -2,9 +2,7 @@
 
 Most loopers trap your audio inside a plugin. This one puts it on the timeline.
 
-Design your loop architecture ahead of time — red clips record, green clips play back — then hit play and perform. As the playhead moves, your loops land in the arrange view as real audio items. Edit them, rearrange them, build on them. Perform the same template twice and get two different results.
-
-Inspired by how [Bink Beats](https://www.youtube.com/watch?v=3bR2ASmxrik) uses Ableton: the structure is decided in advance so you can focus entirely on playing.
+Place red clips to record and green clips to play back. Hit play, and as the playhead moves through them, the recordings land in the arrange view as real audio items so you can edit and arrange them afterward. There's a lot more to it, but the best way to find out is to try it 😉
 
 ## Install
 

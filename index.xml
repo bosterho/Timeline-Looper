@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<index version="1" name="Ostertoaster Scripts">
+  <category name="Scheduled Looper">
+    <reapack name="Scheduled Looper" type="script" desc="Scheduled live looper for REAPER">
+      <version name="1.0">
+        <changelog><![CDATA[Initial release]]></changelog>
+        <source main="main" file="Ostertoaster_LooperJSFX.lua">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/Ostertoaster_LooperJSFX.lua</source>
+        <source file="Ostertoaster/scheduled_looper.jsfx" type="effect">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/scheduled_looper.jsfx</source>
+      </version>
+    </reapack>
+  </category>
+</index>

@@ -493,7 +493,6 @@ local function looper_tick()
   end
   if needs_rescan then
     scan_all_tracks()
-    ensure_jsfx_on_tracks()
     -- Persist crossfade slider values to project data (read from gmem, always in seconds)
     for track in pairs(jsfx_managed) do
       local idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1

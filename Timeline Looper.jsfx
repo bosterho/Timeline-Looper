@@ -1,10 +1,10 @@
 desc:Ostertoaster Timeline Looper
 //tags:looper recording
-options:gmem=scheduled_looper
+options:gmem=timeline_looper
 // Double-buffered looper: records into one buffer while playing from another.
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
-// GMEM LAYOUT (name: "scheduled_looper"):
+// GMEM LAYOUT (name: "timeline_looper"):
 //   Per-track slot (base = 100 + track_index * 50):
 //     [base+0]  = rec_start (seconds)
 //     [base+1]  = rec_end (seconds)

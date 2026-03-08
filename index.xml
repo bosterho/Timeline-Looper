@@ -4,8 +4,8 @@
     <reapack name="Ostertoaster Timeline Looper" type="script" desc="Timeline looper for REAPER — loops print to the arrange view">
       <version name="1.0">
         <changelog><![CDATA[Initial release]]></changelog>
-        <source main="main" file="Ostertoaster_Looper.lua">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/Ostertoaster_Looper.lua</source>
-        <source file="Ostertoaster/scheduled_looper.jsfx" type="effect">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/scheduled_looper.jsfx</source>
+        <source main="main" file="Ostertoaster_Timeline Looper.lua">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/Ostertoaster_Timeline%20Looper.lua</source>
+        <source file="Ostertoaster/Timeline Looper.jsfx" type="effect">https://raw.githubusercontent.com/bosterho/Scheduled-Looper/main/Timeline%20Looper.jsfx</source>
       </version>
     </reapack>
   </category>

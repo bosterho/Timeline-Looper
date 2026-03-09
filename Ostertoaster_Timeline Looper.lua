@@ -152,6 +152,14 @@ local function restore_track_state()
   track_original_state = {}
 end
 
+local function find_jsfx(track)
+  for i = 0, reaper.TrackFX_GetCount(track) - 1 do
+    local _, name = reaper.TrackFX_GetFXName(track, i, "")
+    if name and name:lower():find("timeline looper") then return i end
+  end
+  return -1
+end
+
 local function remove_all_jsfx()
   local num_tracks = reaper.CountTracks(0)
   for t = 0, num_tracks - 1 do
@@ -543,12 +551,22 @@ local function looper_tick()
   -- Handle arm state transitions
   if looper_armed and not was_armed then
     last_play_state = reaper.GetPlayState()
+    -- Un-bypass JSFX on all managed tracks
+    for track in pairs(jsfx_managed) do
+      local fx_idx = find_jsfx(track)
+      if fx_idx >= 0 then reaper.TrackFX_SetEnabled(track, fx_idx, true) end
+    end
   elseif not looper_armed and was_armed then
     export_queue = {}
     pending_export = nil
     if saved_edit_cursor then
       reaper.SetEditCurPos(saved_edit_cursor, false, false)
       saved_edit_cursor = nil
+    end
+    -- Bypass JSFX on all managed tracks so child track audio passes through
+    for track in pairs(jsfx_managed) do
+      local fx_idx = find_jsfx(track)
+      if fx_idx >= 0 then reaper.TrackFX_SetEnabled(track, fx_idx, false) end
     end
   end
   was_armed = looper_armed
@@ -852,8 +870,22 @@ end
 local ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
 local font = reaper.ImGui_CreateFont("sans-serif", 14)
 reaper.ImGui_Attach(ctx, font)
+local my_project = reaper.EnumProjects(-1)
 
 local function imgui_loop()
+  -- Hide window when a different project tab is active
+  if reaper.EnumProjects(-1) ~= my_project then
+    reaper.defer(imgui_loop)
+    return
+  end
+
+  -- Recreate context if it expired while on another tab
+  if not reaper.ImGui_ValidatePtr(ctx, 'ImGui_Context*') then
+    ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
+    font = reaper.ImGui_CreateFont("sans-serif", 14)
+    reaper.ImGui_Attach(ctx, font)
+  end
+
   reaper.ImGui_PushFont(ctx, font)
   reaper.ImGui_SetNextWindowSize(ctx, 250, 80, reaper.ImGui_Cond_Always())
   local visible, open = reaper.ImGui_Begin(ctx, SCRIPT_NAME, true,

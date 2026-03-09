@@ -5,7 +5,12 @@
       "WebFetch(domain:www.reaper.fm)",
       "WebFetch(domain:www.extremraym.com)",
       "WebFetch(domain:github.com)",
-      "Read(//c/Users/ben/AppData/Roaming/REAPER/Effects/**)"
+      "Read(//c/Users/ben/AppData/Roaming/REAPER/Effects/**)",
+      "Read(//c/Users/ben/AppData/Roaming/REAPER/**)",
+      "WebFetch(domain:forums.cockos.com)",
+      "WebFetch(domain:forum.cockos.com)",
+      "WebFetch(domain:www.kvraudio.com)",
+      "WebFetch(domain:recording.de)"
     ],
     "additionalDirectories": [
       "c:\\Users\\ben\\AppData\\Roaming\\REAPER\\Effects"

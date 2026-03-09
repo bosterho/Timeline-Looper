@@ -1,6 +1,6 @@
 desc:Ostertoaster Timeline Looper
 //tags:looper recording
-options:gmem=timeline_looper
+options:gmem=timeline_looper, gfx_idle=1
 // Double-buffered looper: records into one buffer while playing from another.
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
@@ -26,9 +26,10 @@ options:gmem=timeline_looper
 //     [60 + track_index] = export buffer index (0=A, 1=B)
 //     [70 + track_index] = play buffer: main frames
 //     [80 + track_index] = play buffer: pre-roll frame count
+//     [90 + track_index] = PDC offset (samples, from Lua)
 
 slider1:0<0,127,1>Track Index
-slider2:50<5,1000,1>Crossfade (ms)
+slider2:50<5,1000,1>xfade
 
 @init
 FRAMES_MAX = 2000000; // ~41s at 48kHz
@@ -54,6 +55,8 @@ XFADE = slider2 / 1000;
 PRE_ROLL = XFADE;
 POST_ROLL = XFADE;
 gmem[30 + my_track] = XFADE;
+pdc_smp = gmem[90 + my_track];
+pdc_sec = pdc_smp / srate;
 
 // Read current group for this track
 gm = 100 + my_track * 50;
@@ -102,10 +105,12 @@ play_state > 0 && has_group ? (
   n_play = gmem[gm + 3];
 
   // --- Recording (into rec buffer) ---
+  // Use PDC-corrected position so buffer content aligns with real transport time
+  rpos = pos - pdc_sec;
   pre_s = rec_s - PRE_ROLL;
   post_e = rec_e + POST_ROLL;
-  in_rec_ext = !rec_muted && pos >= pre_s && pos < post_e;
-  in_main_rec = !rec_muted && pos >= rec_s && pos < rec_e;
+  in_rec_ext = !rec_muted && rpos >= pre_s && rpos < post_e;
+  in_main_rec = !rec_muted && rpos >= rec_s && rpos < rec_e;
   was_rec_ext = rst[2];
   was_main = rst[5];
 
@@ -135,6 +140,11 @@ play_state > 0 && has_group ? (
   rst[5] = in_main_rec;
 
   // --- Playback (from play buffer, with crossfade at loop boundaries) ---
+  // Use raw pos (play_position) which is already PDC-ahead of real transport.
+  // Buffer is indexed to real transport time (recording subtracts PDC).
+  // Reading PDC-ahead + downstream FX delay = correct output timing.
+  ppos = pos;
+
   pprl = pst[3];
   pml = pst[4];
   ptotal = pst[0];
@@ -160,10 +170,10 @@ play_state > 0 && has_group ? (
       p_muted = p_flags & 1;
       p_reverse = (p_flags >> 1) & 1;
 
-      !p_muted && pos >= ps - PRE_ROLL && pos < pe + POST_ROLL ? (
+      !p_muted && ppos >= ps - PRE_ROLL && ppos < pe + POST_ROLL ? (
         play_len = pe - ps;
         n_iters = ceil(play_len / loop_sec);
-        base_iter = floor((pos - ps) / loop_sec);
+        base_iter = floor((ppos - ps) / loop_sec);
 
         out0 = 0;
         out1 = 0;
@@ -179,8 +189,8 @@ play_state > 0 && has_group ? (
             ie = ig + loop_sec + POST_ROLL;
           );
 
-          pos >= is && pos < ie ? (
-            soff = floor((pos - ig) * srate + 0.5);
+          ppos >= is && ppos < ie ? (
+            soff = floor((ppos - ig) * srate + 0.5);
             p_reverse ? (
               bp = pprl + pml - 1 - soff;
             ) : (
@@ -191,7 +201,7 @@ play_state > 0 && has_group ? (
               soff < 0 && fi_smp > 0 ? (
                 g = max(0, (fi_smp + soff) / fi_smp);
               );
-              r = floor((ie - pos) * srate + 0.5);
+              r = floor((ie - ppos) * srate + 0.5);
               r < fo_smp && fo_smp > 0 ? ( g *= r / fo_smp; );
               out0 += play_bb[bp * 2] * g;
               out1 += play_bb[bp * 2 + 1] * g;
@@ -258,7 +268,11 @@ has_group ? (
   gfx_drawstr("Waiting...");
 );
 
-// Line 2: Crossfade
+// Line 2: Crossfade + PDC
 gfx_x = 10; gfx_y = 20;
 gfx_set(0.6, 0.7, 0.8);
-gfx_drawstr(sprintf(#, "XFade:%dms", floor(slider2 + 0.5)));
+pdc_smp > 0 ? (
+  gfx_drawstr(sprintf(#, "XFade:%dms PDC:%d", floor(slider2 + 0.5), pdc_smp));
+) : (
+  gfx_drawstr(sprintf(#, "XFade:%dms", floor(slider2 + 0.5)));
+);

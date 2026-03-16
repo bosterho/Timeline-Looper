@@ -5,15 +5,16 @@ options:gmem=timeline_looper, gfx_idle=1
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
 // GMEM LAYOUT (name: "timeline_looper"):
-//   Per-track slot (base = 1000 + track_index * 50):
+//   Per-track slot (base = 1000 + track_index * 100):
 //     [base+0]  = rec_start (seconds)
 //     [base+1]  = rec_end (seconds)
 //     [base+2]  = rec_muted (0/1)
 //     [base+3]  = num_play_regions
-//     Per play region j (pbase = base + 4 + j*3):
+//     Per play region j (pbase = base + 4 + j*4):
 //       [pbase+0] = play_start
 //       [pbase+1] = play_end
-//       [pbase+2] = play_muted
+//       [pbase+2] = play_flags (bit0=muted, bit1=reverse)
+//       [pbase+3] = play_rate (float, default 1.0)
 //
 //   Global:
 //     [0] = export trigger (track_index + 1, 0=none)
@@ -28,6 +29,12 @@ options:gmem=timeline_looper, gfx_idle=1
 //     [700 + track_index] = play buffer: main frames
 //     [800 + track_index] = play buffer: pre-roll frame count
 //     [900 + track_index] = PDC offset (samples, from Lua)
+//   Per-play-clip volume envelope (base = 5000 + track_index * 200 + clip_j * 9):
+//     [base+0]  = num_points (0-4)
+//     [base+1..8] = pairs of (time_relative_to_play_start, value)
+//   Per-play-clip pan envelope (base = 7000 + track_index * 200 + clip_j * 9):
+//     [base+0]  = num_points (0-4)
+//     [base+1..8] = pairs of (time_relative_to_play_start, value) — pan -1..1
 
 slider1:0<0,127,1>Track Index
 slider2:200<5,1000,1>xfade
@@ -40,11 +47,15 @@ BUF_A = 0;
 BUF_B = BUF_STRIDE;
 ST_A = BUF_STRIDE * 2;
 ST_B = ST_A + 8;
-PC = ST_B + 8; // Play region cache (max 15 regions * 3 values)
 MAX_PLAY = 15;
+PC = ST_B + 8; // Play region cache (max 15 regions * 4 values)
+EC = PC + MAX_PLAY * 4; // Volume envelope cache (max 15 regions * 9 values: 1 count + 4 time/val pairs)
+PEC = EC + MAX_PLAY * 9; // Pan envelope cache (same layout as EC)
 MAX_BLOCK = 2048;
 AUDIO_BASE = 10000; // gmem base for input audio from mic track
-freembuf(PC + MAX_PLAY * 3);
+ENV_BASE = 5000; // gmem base for volume envelope data per track
+PAN_ENV_BASE = 7000; // gmem base for pan envelope data per track
+freembuf(PEC + MAX_PLAY * 9);
 
 // State per buffer: [0]=total_len, [1]=wpos, [2]=was_in_rec_ext, [3]=pre_roll_len, [4]=main_len, [5]=was_in_main
 i = 0;
@@ -65,7 +76,7 @@ pdc_smp = gmem[900 + my_track];
 pdc_sec = pdc_smp / srate;
 
 // Cache all gmem data for this block (prevents mid-block race with Lua)
-gm = 1000 + my_track * 50;
+gm = 1000 + my_track * 100;
 c_rec_s = gmem[gm];
 c_rec_e = gmem[gm + 1];
 c_rec_muted = gmem[gm + 2];
@@ -73,9 +84,30 @@ c_n_play = min(floor(gmem[gm + 3]), MAX_PLAY);
 has_group = (c_rec_s != 0 || c_rec_e != 0) ? 1 : 0;
 i = 0;
 while (i < c_n_play) (
-  PC[i * 3]     = gmem[gm + 4 + i * 3];
-  PC[i * 3 + 1] = gmem[gm + 4 + i * 3 + 1];
-  PC[i * 3 + 2] = gmem[gm + 4 + i * 3 + 2];
+  PC[i * 4]     = gmem[gm + 4 + i * 4];
+  PC[i * 4 + 1] = gmem[gm + 4 + i * 4 + 1];
+  PC[i * 4 + 2] = gmem[gm + 4 + i * 4 + 2];
+  PC[i * 4 + 3] = gmem[gm + 4 + i * 4 + 3];
+  // Cache volume envelope data for this play region
+  eg = ENV_BASE + my_track * 200 + i * 9;
+  en = min(floor(gmem[eg]), 4);
+  EC[i * 9] = en;
+  j = 0;
+  while (j < en) (
+    EC[i * 9 + 1 + j * 2] = gmem[eg + 1 + j * 2];
+    EC[i * 9 + 2 + j * 2] = gmem[eg + 2 + j * 2];
+    j += 1;
+  );
+  // Cache pan envelope data for this play region
+  pg = PAN_ENV_BASE + my_track * 200 + i * 9;
+  pn = min(floor(gmem[pg]), 4);
+  PEC[i * 9] = pn;
+  j = 0;
+  while (j < pn) (
+    PEC[i * 9 + 1 + j * 2] = gmem[pg + 1 + j * 2];
+    PEC[i * 9 + 2 + j * 2] = gmem[pg + 2 + j * 2];
+    j += 1;
+  );
   i += 1;
 );
 
@@ -172,7 +204,6 @@ play_state >= 5 && has_group ? (
     ptotal = in_rec_ext ? rst[1] : rst[0];
     pprl = rst[3];
   );
-  loop_sec = pml / srate;
   fi_smp = PRE_ROLL * srate;
   fo_smp = POST_ROLL * srate;
 
@@ -181,17 +212,20 @@ play_state >= 5 && has_group ? (
     mix1 = 0;
     pj = 0;
     while (pj < n_play) (
-      pm = pj * 3;
+      pm = pj * 4;
       ps = PC[pm];
       pe = PC[pm + 1];
       p_flags = floor(PC[pm + 2]);
+      p_rate = PC[pm + 3];
+      p_rate <= 0 ? p_rate = 1.0;
       p_muted = p_flags & 1;
       p_reverse = (p_flags >> 1) & 1;
 
       !p_muted && ppos >= ps - PRE_ROLL && ppos < pe + POST_ROLL ? (
         play_len = pe - ps;
-        n_iters = ceil(play_len / loop_sec);
-        base_iter = floor((ppos - ps) / loop_sec);
+        p_loop_sec = pml / (srate * p_rate);
+        n_iters = ceil(play_len / p_loop_sec);
+        base_iter = floor((ppos - ps) / p_loop_sec);
 
         out0 = 0;
         out1 = 0;
@@ -199,33 +233,108 @@ play_state >= 5 && has_group ? (
         ci_max = min(base_iter + 1, n_iters - 1);
 
         while (ci <= ci_max) (
-          ig = ps + ci * loop_sec;
+          ig = ps + ci * p_loop_sec;
           is = ig - PRE_ROLL;
           ci == n_iters - 1 ? (
             ie = pe + POST_ROLL;
           ) : (
-            ie = ig + loop_sec + POST_ROLL;
+            ie = ig + p_loop_sec + POST_ROLL;
           );
 
           ppos >= is && ppos < ie ? (
-            soff = floor((ppos - ig) * srate + 0.5);
+            // Buffer position scaled by playrate (fractional for interpolation)
+            soff_f = (ppos - ig) * srate * p_rate;
             p_reverse ? (
-              bp = pprl + pml - 1 - soff;
+              bp_f = pprl + pml - 1 - soff_f;
             ) : (
-              bp = pprl + soff;
+              bp_f = pprl + soff_f;
             );
-            bp >= 0 && bp < ptotal ? (
+            bp0 = floor(bp_f);
+            frac = bp_f - bp0;
+            bp1 = p_reverse ? bp0 - 1 : bp0 + 1;
+
+            bp0 >= 0 && bp0 < ptotal ? (
+              // Crossfade gain in timeline time (not buffer time)
               g = 1.0;
-              soff < 0 && fi_smp > 0 ? (
-                g = max(0, (fi_smp + soff) / fi_smp);
+              soff_t = (ppos - ig) * srate;
+              soff_t < 0 && fi_smp > 0 ? (
+                g = max(0, (fi_smp + soff_t) / fi_smp);
               );
-              r = floor((ie - ppos) * srate + 0.5);
+              r = (ie - ppos) * srate;
               r < fo_smp && fo_smp > 0 ? ( g *= r / fo_smp; );
-              out0 += play_bb[bp * 2] * g;
-              out1 += play_bb[bp * 2 + 1] * g;
+
+              s0_L = play_bb[bp0 * 2];
+              s0_R = play_bb[bp0 * 2 + 1];
+              bp1 >= 0 && bp1 < ptotal ? (
+                s1_L = play_bb[bp1 * 2];
+                s1_R = play_bb[bp1 * 2 + 1];
+                out0 += (s0_L + frac * (s1_L - s0_L)) * g;
+                out1 += (s0_R + frac * (s1_R - s0_R)) * g;
+              ) : (
+                out0 += s0_L * g;
+                out1 += s0_R * g;
+              );
             );
           );
           ci += 1;
+        );
+
+        // Apply volume envelope for this play clip
+        em = pj * 9;
+        e_n = EC[em];
+        e_n > 0 ? (
+          env_t = (ppos - ps) * p_rate; // time in take source time (scaled by playrate)
+          // Linear interpolation between envelope points
+          env_t <= EC[em + 1] ? (
+            env_g = EC[em + 2]; // before first point: use first value
+          ) : env_t >= EC[em + 1 + (e_n - 1) * 2] ? (
+            env_g = EC[em + 2 + (e_n - 1) * 2]; // after last point: use last value
+          ) : (
+            env_g = EC[em + 2]; // default
+            ei = 1;
+            while (ei < e_n) (
+              ei_t = EC[em + 1 + ei * 2];
+              ei_t >= env_t ? (
+                p0_t = EC[em + 1 + (ei - 1) * 2];
+                p0_v = EC[em + 2 + (ei - 1) * 2];
+                p1_v = EC[em + 2 + ei * 2];
+                env_g = p0_v + (p1_v - p0_v) * (env_t - p0_t) / max(ei_t - p0_t, 0.0001);
+                ei = e_n; // break
+              );
+              ei += 1;
+            );
+          );
+          out0 *= env_g;
+          out1 *= env_g;
+        );
+
+        // Apply pan envelope for this play clip
+        pem = pj * 9;
+        pe_n = PEC[pem];
+        pe_n > 0 ? (
+          pan_t = (ppos - ps) * p_rate;
+          pan_t <= PEC[pem + 1] ? (
+            pan_v = PEC[pem + 2];
+          ) : pan_t >= PEC[pem + 1 + (pe_n - 1) * 2] ? (
+            pan_v = PEC[pem + 2 + (pe_n - 1) * 2];
+          ) : (
+            pan_v = PEC[pem + 2];
+            pi = 1;
+            while (pi < pe_n) (
+              pi_t = PEC[pem + 1 + pi * 2];
+              pi_t >= pan_t ? (
+                pp0_t = PEC[pem + 1 + (pi - 1) * 2];
+                pp0_v = PEC[pem + 2 + (pi - 1) * 2];
+                pp1_v = PEC[pem + 2 + pi * 2];
+                pan_v = pp0_v + (pp1_v - pp0_v) * (pan_t - pp0_t) / max(pi_t - pp0_t, 0.0001);
+                pi = pe_n; // break
+              );
+              pi += 1;
+            );
+          );
+          // Stereo balance: pan_v in -1..1 (negative=left, positive=right)
+          out0 *= min(1, 1 + pan_v);
+          out1 *= min(1, 1 - pan_v);
         );
 
         mix0 += out0;
@@ -294,3 +403,4 @@ pdc_smp > 0 ? (
 ) : (
   gfx_drawstr(sprintf(#, "XFade:%dms", floor(slider2 + 0.5)));
 );
+

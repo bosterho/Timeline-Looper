@@ -435,7 +435,7 @@ local function write_gmem()
     local rec_group = td.groups[td.current]
     if not rec_group then goto continue end
     local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-    local base = 1000 + track_idx * 50
+    local base = 1000 + track_idx * 100
 
     -- Write rec region from current (rec) group
     local rec_start = get_item_pos(rec_group.rec_item)
@@ -447,9 +447,11 @@ local function write_gmem()
     -- Write play regions from play group (may differ from rec group)
     local play_group = td.groups[td.play_current]
     if play_group then
-      reaper.gmem_write(base + 3, #play_group.play_items)
-      for j, play_item in ipairs(play_group.play_items) do
-        local pbase = base + 4 + (j - 1) * 3
+      local max_play = math.min(#play_group.play_items, 15)
+      reaper.gmem_write(base + 3, max_play)
+      for j = 1, max_play do
+        local play_item = play_group.play_items[j]
+        local pbase = base + 4 + (j - 1) * 4
         local ps = get_item_pos(play_item)
         reaper.gmem_write(pbase, ps)
         reaper.gmem_write(pbase + 1, ps + get_item_len(play_item))
@@ -457,6 +459,41 @@ local function write_gmem()
         if is_item_muted(play_item) then flags = flags + 1 end
         if get_item_name(play_item):find("rev") then flags = flags + 2 end
         reaper.gmem_write(pbase + 2, flags)
+        -- Playrate from play item's take
+        local take = reaper.GetActiveTake(play_item)
+        local playrate = take and reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 1.0
+        reaper.gmem_write(pbase + 3, playrate)
+
+        -- Write volume envelope points for this play clip
+        -- ENV_BASE = 5000, per track: 5000 + track_idx * 200, per clip: j * 9
+        local env_base = 5000 + track_idx * 200 + (j - 1) * 9
+        local env = take and reaper.GetTakeEnvelopeByName(take, "Volume")
+        if env then
+          local n_pts = math.min(reaper.CountEnvelopePoints(env), 4)
+          reaper.gmem_write(env_base, n_pts)
+          for p = 0, n_pts - 1 do
+            local _, pt_time, pt_val = reaper.GetEnvelopePoint(env, p)
+            reaper.gmem_write(env_base + 1 + p * 2, pt_time)
+            reaper.gmem_write(env_base + 2 + p * 2, pt_val)
+          end
+        else
+          reaper.gmem_write(env_base, 0)
+        end
+        -- Write pan envelope points for this play clip
+        -- PAN_ENV_BASE = 7000, per track: 7000 + track_idx * 200, per clip: j * 9
+        local pan_env_base = 7000 + track_idx * 200 + (j - 1) * 9
+        local pan_env = take and reaper.GetTakeEnvelopeByName(take, "Pan")
+        if pan_env then
+          local n_pts = math.min(reaper.CountEnvelopePoints(pan_env), 4)
+          reaper.gmem_write(pan_env_base, n_pts)
+          for p = 0, n_pts - 1 do
+            local _, pt_time, pt_val = reaper.GetEnvelopePoint(pan_env, p)
+            reaper.gmem_write(pan_env_base + 1 + p * 2, pt_time)
+            reaper.gmem_write(pan_env_base + 2 + p * 2, pt_val)
+          end
+        else
+          reaper.gmem_write(pan_env_base, 0)
+        end
       end
     else
       reaper.gmem_write(base + 3, 0)
@@ -558,7 +595,134 @@ local function compute_export_params(src_filename, rec_len, saved_prl)
   }
 end
 
-local function place_single_item(audio_track, position, length, ep, is_reverse)
+-- Linearly interpolate envelope value between two points at a given time
+local function lerp_env_value(t, pts)
+  if #pts == 0 then return 1.0 end
+  if t <= pts[1].t then return pts[1].v end
+  if t >= pts[#pts].t then return pts[#pts].v end
+  for i = 2, #pts do
+    if t <= pts[i].t then
+      local p0, p1 = pts[i-1], pts[i]
+      local frac = (p1.t == p0.t) and 0 or (t - p0.t) / (p1.t - p0.t)
+      return p0.v + frac * (p1.v - p0.v)
+    end
+  end
+  return pts[#pts].v
+end
+
+-- Copy item envelopes from source to destination, slicing to the copy's time window.
+-- src_time_offset = time in source item that maps to destination item start (can be negative).
+-- dst_length = destination item's timeline length.
+-- Interpolates boundary values so envelope ramps are preserved across loop copies.
+local function copy_item_envelopes(src_item, dst_item, src_time_offset, dst_length)
+  local _, src_chunk = reaper.GetItemStateChunk(src_item, "", false)
+  local _, dst_chunk = reaper.GetItemStateChunk(dst_item, "", false)
+
+  -- Extract envelope blocks from source (top-level blocks in ITEM chunk)
+  local env_blocks = {}
+  local lines = {}
+  for line in src_chunk:gmatch("[^\r\n]+") do lines[#lines + 1] = line end
+
+  local i = 1
+  while i <= #lines do
+    if lines[i]:match("^<[A-Z_]*ENV") then
+      local block = { lines[i] }
+      local depth = 1
+      i = i + 1
+      while i <= #lines and depth > 0 do
+        block[#block + 1] = lines[i]
+        if lines[i]:match("^%s*<") then depth = depth + 1 end
+        if lines[i]:match("^%s*>%s*$") then depth = depth - 1 end
+        i = i + 1
+      end
+      env_blocks[#env_blocks + 1] = block
+    else
+      i = i + 1
+    end
+  end
+
+  if #env_blocks == 0 then return end
+
+  local win_start = src_time_offset
+  local win_end = src_time_offset + dst_length
+
+  -- Slice each envelope block to the copy's time window with interpolated boundaries
+  local adjusted_blocks = {}
+  for _, block in ipairs(env_blocks) do
+    -- Collect all PT entries with their original data
+    local pts = {}
+    local header_lines = {}
+    local closing = nil
+    for _, line in ipairs(block) do
+      local time_str, val_str, rest = line:match("^PT ([%d%.%-e]+) ([%d%.%-e]+) (.*)")
+      if time_str then
+        pts[#pts + 1] = { t = tonumber(time_str), v = tonumber(val_str), rest = rest, line = line }
+      elseif line:match("^%s*>%s*$") then
+        closing = line
+      else
+        header_lines[#header_lines + 1] = line
+      end
+    end
+
+    if #pts == 0 then goto next_block end
+
+    -- Build sliced points for this copy
+    local new_pts = {}
+
+    -- Add interpolated boundary point at window start if needed
+    local first_in = nil
+    for _, p in ipairs(pts) do
+      if p.t >= win_start then first_in = p; break end
+    end
+    if first_in and first_in.t > win_start + 0.001 then
+      local v = lerp_env_value(win_start, pts)
+      new_pts[#new_pts + 1] = { t = 0, v = v, rest = "0" }
+    end
+
+    -- Add original points that fall within window (shifted to dst time)
+    for _, p in ipairs(pts) do
+      if p.t >= win_start - 0.001 and p.t <= win_end + 0.001 then
+        new_pts[#new_pts + 1] = {
+          t = math.max(0, p.t - win_start),
+          v = p.v,
+          rest = p.rest,
+        }
+      end
+    end
+
+    -- Add interpolated boundary point at window end if needed
+    local last_in = nil
+    for j = #pts, 1, -1 do
+      if pts[j].t <= win_end then last_in = pts[j]; break end
+    end
+    if last_in and last_in.t < win_end - 0.001 then
+      local v = lerp_env_value(win_end, pts)
+      new_pts[#new_pts + 1] = { t = dst_length, v = v, rest = "0" }
+    end
+
+    if #new_pts == 0 then goto next_block end
+
+    -- Rebuild the envelope block
+    local adj = {}
+    for _, hl in ipairs(header_lines) do adj[#adj + 1] = hl end
+    for _, np in ipairs(new_pts) do
+      adj[#adj + 1] = string.format("PT %.10f %.10f %s", np.t, np.v, np.rest)
+    end
+    adj[#adj + 1] = closing or ">"
+    adjusted_blocks[#adjusted_blocks + 1] = table.concat(adj, "\n")
+    ::next_block::
+  end
+
+  if #adjusted_blocks == 0 then return end
+
+  -- Insert adjusted envelope blocks before the final > of the destination item chunk
+  local insert_text = table.concat(adjusted_blocks, "\n") .. "\n"
+  dst_chunk = dst_chunk:gsub("\n>%s*$", "\n" .. insert_text .. ">")
+  reaper.SetItemStateChunk(dst_item, dst_chunk, false)
+end
+
+local function place_single_item(audio_track, position, length, ep, is_reverse, playrate)
+  playrate = playrate or 1.0
   local new_item = reaper.AddMediaItemToTrack(audio_track)
   local new_take = reaper.AddTakeToMediaItem(new_item)
   local new_source = reaper.PCM_Source_CreateFromFile(ep.file)
@@ -567,10 +731,18 @@ local function place_single_item(audio_track, position, length, ep, is_reverse)
   reaper.SetMediaItemInfo_Value(new_item, "D_POSITION", position)
   reaper.SetMediaItemInfo_Value(new_item, "D_LENGTH", length)
   reaper.SetMediaItemTakeInfo_Value(new_take, "D_STARTOFFS", ep.src_offset or 0)
-  local xfade = ep.actual_pre + ep.actual_post
+  -- Playrate (no preserve pitch — JSFX can't pitch-stretch live playback)
+  if playrate ~= 1.0 then
+    reaper.SetMediaItemTakeInfo_Value(new_take, "D_PLAYRATE", playrate)
+  end
+  reaper.SetMediaItemTakeInfo_Value(new_take, "B_PPITCH", 0)
+  -- Crossfade and snap offset scaled to timeline time
+  local eff_pre = ep.actual_pre / playrate
+  local eff_post = ep.actual_post / playrate
+  local xfade = eff_pre + eff_post
   reaper.SetMediaItemInfo_Value(new_item, "D_FADEINLEN", xfade)
   reaper.SetMediaItemInfo_Value(new_item, "D_FADEOUTLEN", xfade)
-  reaper.SetMediaItemInfo_Value(new_item, "D_SNAPOFFSET", ep.actual_pre)
+  reaper.SetMediaItemInfo_Value(new_item, "D_SNAPOFFSET", eff_pre)
   if is_reverse then
     reaper.SetMediaItemSelected(new_item, true)
     reaper.Main_OnCommand(41051, 0) -- Toggle take reverse
@@ -594,27 +766,37 @@ local function place_play_item_audio(audio_track, play_item, ep)
   local play_len = get_item_len(play_item)
   local play_end = play_pos + play_len
   local is_reverse = get_item_name(play_item):find("rev") ~= nil
-  local ratio = play_len / ep.rec_len
+
+  -- Read playrate from play item's take
+  local take = reaper.GetActiveTake(play_item)
+  local playrate = take and reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE") or 1.0
+
+  -- Effective dimensions in timeline time (scaled by playrate)
+  local eff_rec = ep.rec_len / playrate
+  local eff_pre = ep.actual_pre / playrate
+  local eff_post = ep.actual_post / playrate
+
+  local ratio = play_len / eff_rec
   local n_copies = math.ceil(ratio - 1e-9)
   local items = {}
   for c = 0, n_copies - 1 do
-    local grid_pos = play_pos + c * ep.rec_len
+    local grid_pos = play_pos + c * eff_rec
     local remaining = play_end - grid_pos
-    local copy_main = math.min(ep.rec_len, remaining)
-    local item_pos = grid_pos - ep.actual_pre
-    local item_len = copy_main + ep.actual_pre + ep.actual_post
+    local copy_main = math.min(eff_rec, remaining)
+    local item_pos = grid_pos - eff_pre
+    local item_len = copy_main + eff_pre + eff_post
     local item
-    if is_reverse and copy_main < ep.rec_len then
+    if is_reverse and copy_main < eff_rec then
       -- Create at full length so reverse operates on full source, then trim
-      local full_len = ep.rec_len + ep.actual_pre + ep.actual_post
-      item = place_single_item(audio_track, item_pos, full_len, ep, true)
+      local full_len = eff_rec + eff_pre + eff_post
+      item = place_single_item(audio_track, item_pos, full_len, ep, true, playrate)
       reaper.SetMediaItemInfo_Value(item, "D_LENGTH", item_len)
     else
-      item = place_single_item(audio_track, item_pos, item_len, ep, is_reverse)
+      item = place_single_item(audio_track, item_pos, item_len, ep, is_reverse, playrate)
     end
     -- Last copy has nothing after it — fade-out only covers the post-roll
     if c == n_copies - 1 then
-      reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", ep.actual_post)
+      reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", eff_post)
     end
     items[#items + 1] = item
   end
@@ -629,6 +811,12 @@ local function place_play_item_audio(audio_track, play_item, ep)
     for _, item in ipairs(items) do
       reaper.SetMediaItemInfo_Value(item, "I_GROUPID", group_id)
     end
+  end
+  -- Copy item envelopes from play clip to exported audio items
+  for ci, item in ipairs(items) do
+    local src_offset = (ci - 1) * eff_rec - eff_pre
+    local dst_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    copy_item_envelopes(play_item, item, src_offset, dst_length)
   end
 end
 
@@ -1162,8 +1350,8 @@ if not next(track_data) then
   if track then
     local cursor = reaper.GetCursorPosition()
     local measure_len = get_one_measure_seconds()
-    create_midi_item(track, cursor, measure_len, "rec", 0xFF0000)
-    create_midi_item(track, cursor + measure_len, measure_len, "play", 0x00FF00)
+    create_midi_item(track, cursor, measure_len, "rec", 0x996666)
+    create_midi_item(track, cursor + measure_len, measure_len, "play", 0x6e9966)
     scan_all_tracks()
   end
 end

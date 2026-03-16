@@ -13,8 +13,61 @@
 
 local reaper = reaper
 local SCRIPT_NAME = "Ostertoaster Timeline Looper"
+local _, _, _, SCRIPT_CMD_ID = reaper.get_action_context()
 
 reaper.gmem_attach("timeline_looper")
+
+-- ─── Startup persistence ────────────────────────────────────────────────────
+
+local STARTUP_BEGIN = "-- [Timeline Looper auto-start] --"
+local STARTUP_END   = "-- [/Timeline Looper auto-start] --"
+
+local function get_startup_path()
+  return reaper.GetResourcePath() .. "/Scripts/__startup.lua"
+end
+
+local function install_startup()
+  local cmd_str = reaper.ReverseNamedCommandLookup(SCRIPT_CMD_ID)
+  if not cmd_str then return end
+
+  -- Flag this project for auto-start (saved in .rpp)
+  reaper.SetProjExtState(0, "TimelineLooper", "autostart", "1")
+
+  -- Store command ID persistently so __startup.lua can find us
+  reaper.SetExtState("TimelineLooper", "cmd_id", cmd_str, true)
+
+  -- Add loader block to __startup.lua if not already present
+  local path = get_startup_path()
+  local f = io.open(path, "r")
+  local content = f and f:read("*a") or ""
+  if f then f:close() end
+
+  if content:find(STARTUP_BEGIN, 1, true) then return end
+
+  local block = "\n" .. STARTUP_BEGIN .. "\n"
+    .. "reaper.defer(function()\n"
+    .. "  local retval, val = reaper.GetProjExtState(0, 'TimelineLooper', 'autostart')\n"
+    .. "  if retval > 0 and val == '1' then\n"
+    .. "    local cs = reaper.GetExtState('TimelineLooper', 'cmd_id')\n"
+    .. "    if cs and cs ~= '' then\n"
+    .. "      local cmd = reaper.NamedCommandLookup('_' .. cs)\n"
+    .. "      if cmd > 0 then reaper.Main_OnCommand(cmd, 0) end\n"
+    .. "    end\n"
+    .. "  end\n"
+    .. "end)\n"
+    .. STARTUP_END .. "\n"
+
+  f = io.open(path, "a")
+  if f then
+    f:write(block)
+    f:close()
+  end
+end
+
+local function uninstall_startup()
+  -- Clear the per-project autostart flag
+  reaper.SetProjExtState(0, "TimelineLooper", "autostart", "")
+end
 
 -- ─── State ───────────────────────────────────────────────────────────────────
 
@@ -24,8 +77,8 @@ local SCAN_INTERVAL = 1.0
 local PRE_ROLL = 0.05
 local POST_ROLL = 0.05
 local last_play_state = reaper.GetPlayState()
-local looper_armed = true
-local was_armed = false
+local was_recording = false
+local export_enabled = true
 
 -- Per-track data: keyed by track pointer
 --   .groups = ordered list of { rec_item, play_items={}, track }
@@ -71,7 +124,7 @@ local EXTSTATE_SECTION = "ScheduledLooper"
 
 local function set_track_xfade(track)
   local idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-  local xf = reaper.gmem_read(30 + idx)
+  local xf = reaper.gmem_read(200 + idx)
   if xf > 0 then
     PRE_ROLL = xf; POST_ROLL = xf
     reaper.SetProjExtState(0, EXTSTATE_SECTION, "xfade_" .. idx, tostring(xf))
@@ -137,25 +190,108 @@ end
 
 -- ─── JSFX management ───────────────────────────────────────────────────────
 
-local JSFX_ADD_NAME = "JS:Ostertoaster/Timeline Looper"
-local jsfx_managed = {}
-local track_original_state = {} -- saved arm/monitor state per track
-
-local function restore_track_state()
-  for track, state in pairs(track_original_state) do
-    if reaper.ValidatePtr(track, "MediaTrack*") then
-      reaper.SetMediaTrackInfo_Value(track, "I_RECARM", state.arm)
-      reaper.SetMediaTrackInfo_Value(track, "I_RECMON", 0)
-      reaper.SetMediaTrackInfo_Value(track, "I_RECINPUT", state.input)
+-- Auto-sync JSFX from script directory to Effects folder so there's one source of truth
+do
+  local info = debug.getinfo(1, "S")
+  local script_dir = info.source:match("@?(.*[\\/])")
+  local dst_dir = reaper.GetResourcePath() .. "/Effects/Ostertoaster"
+  reaper.RecursiveCreateDirectory(dst_dir, 0)
+  for _, name in ipairs({"Timeline Looper.jsfx", "Timeline Looper Input.jsfx"}) do
+    local f_in = io.open(script_dir .. name, "rb")
+    if f_in then
+      local content = f_in:read("*a")
+      f_in:close()
+      local f_out = io.open(dst_dir .. "/" .. name, "wb")
+      if f_out then f_out:write(content); f_out:close() end
     end
   end
-  track_original_state = {}
+end
+
+local JSFX_ADD_NAME = "JS:Ostertoaster/Timeline Looper"
+local INPUT_JSFX_NAME = "JS:Ostertoaster/Timeline Looper Input"
+local jsfx_managed = {}
+local mic_track = nil -- single mic track for input capture
+
+local function find_input_jsfx(track)
+  -- Search regular FX chain
+  local count = reaper.TrackFX_GetCount(track)
+  for i = 0, count - 1 do
+    local _, name = reaper.TrackFX_GetFXName(track, i, "")
+    if name and name:lower():find("timeline looper input") then return i end
+  end
+  -- Migrate from input FX chain if found there (old installs)
+  local rec_count = reaper.TrackFX_GetRecCount(track)
+  for i = 0, rec_count - 1 do
+    local _, name = reaper.TrackFX_GetFXName(track, 0x1000000 + i, "")
+    if name and name:lower():find("timeline looper input") then
+      reaper.TrackFX_Delete(track, 0x1000000 + i)
+      local fx_idx = reaper.TrackFX_AddByName(track, INPUT_JSFX_NAME, false, -1)
+      return fx_idx
+    end
+  end
+  return -1
+end
+
+local function ensure_mic_track()
+  -- Find existing mic track (has input JSFX on regular FX chain)
+  local num_tracks = reaper.CountTracks(0)
+  for t = 0, num_tracks - 1 do
+    local track = reaper.GetTrack(0, t)
+    if find_input_jsfx(track) >= 0 then
+      mic_track = track
+      -- Re-arm and monitor in case cleanup disabled them
+      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
+      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
+      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2) -- disable recording, monitor only
+      reaper.SetMediaTrackInfo_Value(mic_track, "B_MAINSEND", 0)
+      return mic_track
+    end
+  end
+  -- Create mic track at position 0
+  reaper.InsertTrackAtIndex(0, false)
+  mic_track = reaper.GetTrack(0, 0)
+  reaper.GetSetMediaTrackInfo_String(mic_track, "P_NAME", "Mic", true)
+  reaper.SetMediaTrackInfo_Value(mic_track, "I_CUSTOMCOLOR", reaper.ColorToNative(0xDE, 0x83, 0x83) | 0x1000000)
+  -- Add input JSFX to regular FX chain (unmuting the track feeds audio to master)
+  local fx_idx = reaper.TrackFX_AddByName(mic_track, INPUT_JSFX_NAME, false, -1)
+  if fx_idx < 0 then
+    reaper.ShowMessageBox("Could not add Timeline Looper Input JSFX", SCRIPT_NAME, 0)
+  end
+  -- Arm + monitor so input signal flows through the FX chain, but don't record to disk
+  reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
+  reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
+  reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2) -- disable recording, monitor only
+  -- Set to stereo audio input 1/2 if no input set
+  local cur_input = reaper.GetMediaTrackInfo_Value(mic_track, "I_RECINPUT")
+  if cur_input < 0 or cur_input >= 4096 then
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECINPUT", 1024)
+  end
+  -- Disable master send so it doesn't output to master (enable to hear input)
+  reaper.SetMediaTrackInfo_Value(mic_track, "B_MAINSEND", 0)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.UpdateArrange()
+  return mic_track
+end
+
+local function cleanup_mic_track()
+  if mic_track and reaper.ValidatePtr(mic_track, "MediaTrack*") then
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 0)
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 0)
+  end
+  mic_track = nil
+end
+
+local function restore_track_state()
+  cleanup_mic_track()
 end
 
 local function find_jsfx(track)
   for i = 0, reaper.TrackFX_GetCount(track) - 1 do
     local _, name = reaper.TrackFX_GetFXName(track, i, "")
-    if name and name:lower():find("timeline looper") then return i end
+    if name and name:lower():find("timeline looper")
+      and not name:lower():find("timeline looper input") then
+      return i
+    end
   end
   return -1
 end
@@ -166,7 +302,8 @@ local function remove_all_jsfx()
     local track = reaper.GetTrack(0, t)
     for i = reaper.TrackFX_GetCount(track) - 1, 0, -1 do
       local _, name = reaper.TrackFX_GetFXName(track, i, "")
-      if name and name:lower():find("timeline looper") then
+      if name and name:lower():find("timeline looper")
+        and not name:lower():find("timeline looper input") then
         reaper.TrackFX_Delete(track, i)
       end
     end
@@ -174,45 +311,85 @@ local function remove_all_jsfx()
   jsfx_managed = {}
 end
 
--- Find the child audio track (first child without a Timeline Looper JSFX)
-local function find_child_audio_track(track)
-  local parent_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-  local depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
-  if depth < 1 then return nil end -- not a folder, no children
+-- Find the audio sibling track (same parent folder as JSFX track, no JSFX on it)
+local function find_audio_sibling(jsfx_track)
+  local parent = reaper.GetParentTrack(jsfx_track)
+  if not parent then return nil end
+  local parent_idx = reaper.GetMediaTrackInfo_Value(parent, "IP_TRACKNUMBER") - 1
   local num_tracks = reaper.CountTracks(0)
   local level = 0
   for i = parent_idx + 1, num_tracks - 1 do
-    local child = reaper.GetTrack(0, i)
-    local child_depth = reaper.GetMediaTrackInfo_Value(child, "I_FOLDERDEPTH")
-    if find_jsfx(child) < 0 then return child end
-    level = level + child_depth
-    if level < 0 then break end -- exited the folder
+    local t = reaper.GetTrack(0, i)
+    local d = reaper.GetMediaTrackInfo_Value(t, "I_FOLDERDEPTH")
+    if level == 0 and t ~= jsfx_track and find_jsfx(t) < 0 then
+      return t
+    end
+    level = level + d
+    if level < 0 then break end
   end
   return nil
 end
 
--- Create a child track under the JSFX track if one doesn't exist
-local function ensure_child_track(track)
-  local child = find_child_audio_track(track)
-  if child then return child end
-  local parent_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-  -- Make parent a folder if it isn't already
-  local depth = reaper.GetMediaTrackInfo_Value(track, "I_FOLDERDEPTH")
-  if depth < 1 then
-    reaper.SetMediaTrackInfo_Value(track, "I_FOLDERDEPTH", 1)
+-- Ensure JSFX track is inside a parent folder with an audio sibling:
+--   Parent Track (volume/pan/effects)
+--     JSFX Track (rec/play MIDI items + JSFX)
+--     Audio Track (exported items)
+local function ensure_track_hierarchy(jsfx_track)
+  local audio = find_audio_sibling(jsfx_track)
+  if audio then return audio end
+
+  local jsfx_idx = reaper.GetMediaTrackInfo_Value(jsfx_track, "IP_TRACKNUMBER") - 1
+  local jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
+  local parent = reaper.GetParentTrack(jsfx_track)
+
+  if not parent then
+    -- Create parent folder above the JSFX track
+    reaper.InsertTrackAtIndex(jsfx_idx, false)
+    parent = reaper.GetTrack(0, jsfx_idx)
+    reaper.SetMediaTrackInfo_Value(parent, "I_FOLDERDEPTH", 1)
+    local _, jsfx_name = reaper.GetSetMediaTrackInfo_String(jsfx_track, "P_NAME", "", false)
+    reaper.GetSetMediaTrackInfo_String(parent, "P_NAME", jsfx_name or "Looper", true)
+    reaper.SetMediaTrackInfo_Value(parent, "I_CUSTOMCOLOR", reaper.ColorToNative(0x83, 0xB7, 0xDE) | 0x1000000)
+    reaper.GetSetMediaTrackInfo_String(jsfx_track, "P_NAME", "JSFX", true)
+    -- Refresh after insertion
+    jsfx_idx = reaper.GetMediaTrackInfo_Value(jsfx_track, "IP_TRACKNUMBER") - 1
+    jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
   end
-  -- Insert child track right after parent
-  reaper.InsertTrackAtIndex(parent_idx + 1, false)
-  child = reaper.GetTrack(0, parent_idx + 1)
-  reaper.SetMediaTrackInfo_Value(child, "I_FOLDERDEPTH", -1)
-  reaper.GetSetMediaTrackInfo_String(child, "P_NAME", "Audio", true)
+
+  -- If JSFX track was a folder parent (old setup), flatten to regular child
+  if jsfx_depth == 1 then
+    reaper.SetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH", 0)
+    audio = find_audio_sibling(jsfx_track)
+    if audio then
+      reaper.TrackList_AdjustWindows(false)
+      reaper.UpdateArrange()
+      return audio
+    end
+    jsfx_idx = reaper.GetMediaTrackInfo_Value(jsfx_track, "IP_TRACKNUMBER") - 1
+    jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
+  end
+
+  -- Insert audio sibling after the JSFX track
+  -- Transfer any folder-closing depth from JSFX to the new audio track
+  local audio_depth = -1
+  if jsfx_depth < 0 then
+    audio_depth = jsfx_depth
+    reaper.SetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH", 0)
+  end
+  reaper.InsertTrackAtIndex(jsfx_idx + 1, false)
+  audio = reaper.GetTrack(0, jsfx_idx + 1)
+  reaper.SetMediaTrackInfo_Value(audio, "I_FOLDERDEPTH", audio_depth)
+  reaper.GetSetMediaTrackInfo_String(audio, "P_NAME", "Audio", true)
   reaper.TrackList_AdjustWindows(false)
   reaper.UpdateArrange()
-  return child
+  return audio
 end
 
 local function ensure_jsfx_on_tracks()
   for track in pairs(track_data) do
+    -- Ensure parent folder + audio sibling FIRST (may shift track indices)
+    ensure_track_hierarchy(track)
+
     if not jsfx_managed[track] then
       -- Check if JSFX already exists (query only, don't add)
       local fx_idx = reaper.TrackFX_AddByName(track, JSFX_ADD_NAME, false, 0)
@@ -225,6 +402,7 @@ local function ensure_jsfx_on_tracks()
           reaper.TrackFX_CopyToTrack(track, fx_idx, track, 0, true)
           fx_idx = 0
         end
+        -- Get track_idx AFTER hierarchy changes (index may have shifted)
         local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
         reaper.TrackFX_SetParam(track, fx_idx, 0, track_idx)
         -- Only restore crossfade for newly added JSFX (existing ones keep REAPER-persisted value)
@@ -240,24 +418,13 @@ local function ensure_jsfx_on_tracks()
           reaper.SNM_AddTCPFXParm(track, fx_idx, 1)
         end
       end
-      if not track_original_state[track] then
-        track_original_state[track] = {
-          arm = reaper.GetMediaTrackInfo_Value(track, "I_RECARM"),
-          mon = reaper.GetMediaTrackInfo_Value(track, "I_RECMON"),
-          input = reaper.GetMediaTrackInfo_Value(track, "I_RECINPUT"),
-        }
-        reaper.SetMediaTrackInfo_Value(track, "I_RECARM", 1)
-        reaper.SetMediaTrackInfo_Value(track, "I_RECMON", 1)
-        -- Set to stereo audio input 1/2 if currently set to MIDI or no input
-        local cur_input = track_original_state[track].input
-        if cur_input < 0 or cur_input >= 4096 then
-          reaper.SetMediaTrackInfo_Value(track, "I_RECINPUT", 1024)
-        end
-      end
       jsfx_managed[track] = true
     end
-    -- Ensure a child audio track exists for exported items
-    ensure_child_track(track)
+    -- Disarm JSFX tracks (mic track handles all input)
+    reaper.SetMediaTrackInfo_Value(track, "I_RECARM", 0)
+    -- Disable anticipative FX so track processes in sync with mic track's gmem writes
+    local perf = reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
+    reaper.SetMediaTrackInfo_Value(track, "I_PERFFLAGS", perf | 2)
   end
 end
 
@@ -268,7 +435,7 @@ local function write_gmem()
     local rec_group = td.groups[td.current]
     if not rec_group then goto continue end
     local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-    local base = 100 + track_idx * 50
+    local base = 1000 + track_idx * 50
 
     -- Write rec region from current (rec) group
     local rec_start = get_item_pos(rec_group.rec_item)
@@ -296,8 +463,8 @@ local function write_gmem()
     end
 
     -- Write buffer assignments
-    reaper.gmem_write(50 + track_idx, td.rec_buf)
-    reaper.gmem_write(55 + track_idx, td.play_buf)
+    reaper.gmem_write(400 + track_idx, td.rec_buf)
+    reaper.gmem_write(500 + track_idx, td.play_buf)
     ::continue::
   end
 end
@@ -311,6 +478,8 @@ local saved_edit_cursor = nil
 
 
 local function get_pdc_samples(track)
+  local total_pdc = 0
+  -- Sum PDC from FX after the JSFX on this track
   local fx_count = reaper.TrackFX_GetCount(track)
   local jsfx_idx = -1
   for i = 0, fx_count - 1 do
@@ -320,17 +489,27 @@ local function get_pdc_samples(track)
       break
     end
   end
-  if jsfx_idx < 0 then return 0 end
-  local total_pdc = 0
-  for i = jsfx_idx + 1, fx_count - 1 do
-    local ok, val = reaper.TrackFX_GetNamedConfigParm(track, i, "pdc")
-    if ok then total_pdc = total_pdc + (tonumber(val) or 0) end
+  if jsfx_idx >= 0 then
+    for i = jsfx_idx + 1, fx_count - 1 do
+      local ok, val = reaper.TrackFX_GetNamedConfigParm(track, i, "pdc")
+      if ok then total_pdc = total_pdc + (tonumber(val) or 0) end
+    end
+  end
+  -- Walk up parent chain and sum all FX PDC on each parent track
+  local parent = reaper.GetParentTrack(track)
+  while parent do
+    local pfx_count = reaper.TrackFX_GetCount(parent)
+    for i = 0, pfx_count - 1 do
+      local ok, val = reaper.TrackFX_GetNamedConfigParm(parent, i, "pdc")
+      if ok then total_pdc = total_pdc + (tonumber(val) or 0) end
+    end
+    parent = reaper.GetParentTrack(parent)
   end
   return total_pdc
 end
 
 local function clear_group_audio(group)
-  local audio_track = find_child_audio_track(group.track)
+  local audio_track = find_audio_sibling(group.track)
   if not audio_track then return end
   local ranges = {}
   local rs = get_item_pos(group.rec_item)
@@ -415,7 +594,8 @@ local function place_play_item_audio(audio_track, play_item, ep)
   local play_len = get_item_len(play_item)
   local play_end = play_pos + play_len
   local is_reverse = get_item_name(play_item):find("rev") ~= nil
-  local n_copies = math.ceil(play_len / ep.rec_len)
+  local ratio = play_len / ep.rec_len
+  local n_copies = math.ceil(ratio - 1e-9)
   local items = {}
   for c = 0, n_copies - 1 do
     local grid_pos = play_pos + c * ep.rec_len
@@ -452,10 +632,11 @@ local function place_play_item_audio(audio_track, play_item, ep)
   end
 end
 
-local function queue_export(group, track, group_idx, export_buf)
+local function queue_export(group, track, group_idx, export_buf, force)
+  if not force and not export_enabled then return end
   local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-  local rec_buf_gmem = reaper.gmem_read(50 + track_idx)
-  local prl = reaper.gmem_read(export_buf == rec_buf_gmem and (40 + track_idx) or (80 + track_idx))
+  local rec_buf_gmem = reaper.gmem_read(400 + track_idx)
+  local prl = reaper.gmem_read(export_buf == rec_buf_gmem and (300 + track_idx) or (800 + track_idx))
   export_queue[#export_queue + 1] = {
     group = group,
     track_idx = track_idx,
@@ -466,6 +647,7 @@ local function queue_export(group, track, group_idx, export_buf)
     export_buf = export_buf,
   }
 end
+
 
 local function process_export()
   if not pending_export and #export_queue > 0 then
@@ -490,11 +672,11 @@ local function process_export()
       end
     end
     reaper.Undo_EndBlock("Timeline Looper: clear audio", -1)
-    local audio_track = find_child_audio_track(next_exp.group.track)
+    local audio_track = find_audio_sibling(next_exp.group.track)
     reaper.SetEditCurPos(next_exp.rec_start, false, false)
-    reaper.gmem_write(60 + next_exp.track_idx, next_exp.export_buf)
-    reaper.gmem_write(21, next_exp.track_idx + 1)
-    reaper.gmem_write(20, next_exp.track_idx + 1) -- trigger = track_idx + 1
+    reaper.gmem_write(600 + next_exp.track_idx, next_exp.export_buf)
+    reaper.gmem_write(1, next_exp.track_idx + 1)
+    reaper.gmem_write(0, next_exp.track_idx + 1) -- trigger = track_idx + 1
     pending_export = {
       group = next_exp.group, phase = "wait", tick = 0,
       audio_track = audio_track,
@@ -509,7 +691,7 @@ local function process_export()
 
   if pe.phase == "wait" then
     pe.tick = pe.tick + 1
-    if reaper.gmem_read(20) == 0 then
+    if reaper.gmem_read(0) == 0 then
       pe.phase = "place"
     elseif pe.tick > 60 then
       pending_export = nil
@@ -523,7 +705,7 @@ local function process_export()
     set_track_xfade(pe.group.track)
     -- Re-check for audio track (JSFX export may have created it)
     if not pe.audio_track then
-      pe.audio_track = find_child_audio_track(pe.group.track)
+      pe.audio_track = find_audio_sibling(pe.group.track)
     end
     if pe.audio_track then
       local rec_len = get_item_len(pe.group.rec_item)
@@ -580,30 +762,12 @@ end
 local function looper_tick()
   if not script_running then return end
 
-  -- Handle arm state transitions
-  if looper_armed and not was_armed then
-    last_play_state = reaper.GetPlayState()
-    -- Un-bypass JSFX and enable record monitoring on all managed tracks
-    for track in pairs(jsfx_managed) do
-      local fx_idx = find_jsfx(track)
-      if fx_idx >= 0 then reaper.TrackFX_SetEnabled(track, fx_idx, true) end
-      reaper.SetMediaTrackInfo_Value(track, "I_RECMON", 1)
-    end
-  elseif not looper_armed and was_armed then
-    export_queue = {}
-    pending_export = nil
-    if saved_edit_cursor then
-      reaper.SetEditCurPos(saved_edit_cursor, false, false)
-      saved_edit_cursor = nil
-    end
-    -- Bypass JSFX and disable record monitoring on all managed tracks
-    for track in pairs(jsfx_managed) do
-      local fx_idx = find_jsfx(track)
-      if fx_idx >= 0 then reaper.TrackFX_SetEnabled(track, fx_idx, false) end
-      reaper.SetMediaTrackInfo_Value(track, "I_RECMON", 0)
-    end
+  -- Detect record mode transitions
+  local is_recording = (reaper.GetPlayState() & 4) ~= 0
+  if is_recording and not was_recording then
+    last_play_state = 0  -- trigger play-start group reset on next tick
   end
-  was_armed = looper_armed
+  was_recording = is_recording
 
   -- Periodic rescan
   local now = reaper.time_precise()
@@ -630,17 +794,21 @@ local function looper_tick()
     scan_all_tracks()
     -- Persist crossfade slider values to project data (read from gmem, always in seconds)
     for track in pairs(jsfx_managed) do
-      local idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-      local xf = reaper.gmem_read(30 + idx)
-      if xf > 0 then
-        reaper.SetProjExtState(0, EXTSTATE_SECTION, "xfade_" .. idx, tostring(xf))
+      if reaper.ValidatePtr(track, "MediaTrack*") then
+        local idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
+        local xf = reaper.gmem_read(200 + idx)
+        if xf > 0 then
+          reaper.SetProjExtState(0, EXTSTATE_SECTION, "xfade_" .. idx, tostring(xf))
+        end
+        reaper.gmem_write(900 + idx, get_pdc_samples(track))
       end
-      reaper.gmem_write(90 + idx, get_pdc_samples(track))
     end
     last_scan_time = now
   end
 
-  if not looper_armed then
+  process_export()
+
+  if not is_recording then
     reaper.defer(looper_tick)
     return
   end
@@ -721,13 +889,13 @@ local function looper_tick()
         local rec_end = rec_start + get_item_len(group.rec_item)
         if pos >= rec_end then td.rec_complete = true end
         local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
-        local pdc_smp = reaper.gmem_read(90 + track_idx)
+        local pdc_smp = reaper.gmem_read(900 + track_idx)
         local srate = reaper.GetSetProjectInfo(0, "PROJECT_SRATE", 0, false)
         if srate == 0 then srate = 44100 end
         local pdc_sec = pdc_smp / srate
         if pos >= rec_end + PRE_ROLL + POST_ROLL + pdc_sec then
           if not is_item_muted(group.rec_item) then
-            local buf_len = reaper.gmem_read(10 + track_idx)
+            local buf_len = reaper.gmem_read(100 + track_idx)
             if buf_len > 0 then
               queue_export(group, track, td.current, td.rec_buf)
             end
@@ -829,7 +997,7 @@ local function looper_tick()
       -- Export current rec group if not already exported and rec is active
       local group = td.groups[td.current]
       if group and td.rec_complete and not td.rec_exported and not td.group_exports[td.current] and not is_item_muted(group.rec_item) then
-        local buf_len = reaper.gmem_read(10 + track_idx)
+        local buf_len = reaper.gmem_read(100 + track_idx)
         if buf_len > 0 then
           queue_export(group, track, td.current, td.rec_buf)
         end
@@ -841,7 +1009,6 @@ local function looper_tick()
   last_play_state = play_state
 
   write_gmem()
-  process_export()
 
   -- Place all remaining exported items when stopped
   if play_state == 0 then
@@ -904,16 +1071,9 @@ end
 local ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
 local font = reaper.ImGui_CreateFont("sans-serif", 14)
 reaper.ImGui_Attach(ctx, font)
-local my_project = reaper.EnumProjects(-1)
 
 local function imgui_loop()
-  -- Hide window when a different project tab is active
-  if reaper.EnumProjects(-1) ~= my_project then
-    reaper.defer(imgui_loop)
-    return
-  end
-
-  -- Recreate context if it expired while on another tab
+  -- Recreate context if it expired
   if not reaper.ImGui_ValidatePtr(ctx, 'ImGui_Context*') then
     ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
     font = reaper.ImGui_CreateFont("sans-serif", 14)
@@ -921,35 +1081,38 @@ local function imgui_loop()
   end
 
   reaper.ImGui_PushFont(ctx, font)
-  reaper.ImGui_SetNextWindowSize(ctx, 250, 80, reaper.ImGui_Cond_Always())
+  reaper.ImGui_SetNextWindowSize(ctx, 280, 75, reaper.ImGui_Cond_Always())
   local visible, open = reaper.ImGui_Begin(ctx, SCRIPT_NAME, true,
     reaper.ImGui_WindowFlags_NoFocusOnAppearing() | reaper.ImGui_WindowFlags_NoResize() | reaper.ImGui_WindowFlags_NoNav())
 
   if visible then
-    -- Record toggle button
-    if looper_armed then
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0xCC2222FF)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), 0xDD3333FF)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), 0xAA1111FF)
+    -- Status line
+    local is_rec = (reaper.GetPlayState() & 4) ~= 0
+    if is_rec then
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0xFF4444FF)
+      reaper.ImGui_Text(ctx, "RECORDING")
+      reaper.ImGui_PopStyleColor(ctx)
     else
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Button(), 0x555555FF)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonHovered(), 0x777777FF)
-      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_ButtonActive(), 0x444444FF)
+      reaper.ImGui_PushStyleColor(ctx, reaper.ImGui_Col_Text(), 0x888888FF)
+      reaper.ImGui_Text(ctx, "Idle - hit Record to start")
+      reaper.ImGui_PopStyleColor(ctx)
     end
-    local avail_w = reaper.ImGui_GetContentRegionAvail(ctx)
-    local refresh_w = 70
-    local style_x = reaper.ImGui_GetStyleVar(ctx, reaper.ImGui_StyleVar_ItemSpacing())
-    if reaper.ImGui_Button(ctx, looper_armed and "ARMED" or "ARM", avail_w - refresh_w - style_x, 40) then
-      looper_armed = not looper_armed
-    end
-    reaper.ImGui_PopStyleColor(ctx, 3)
 
-    reaper.ImGui_SameLine(ctx)
-    if reaper.ImGui_Button(ctx, "Refresh", refresh_w, 40) then
+    -- Refresh + Export audio
+    if reaper.ImGui_Button(ctx, "Refresh", 60, 0) then
       restore_track_state()
       remove_all_jsfx()
       scan_all_tracks()
       ensure_jsfx_on_tracks()
+    end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      reaper.ImGui_SetTooltip(ctx, "Click this after adding rec/play clips to new tracks")
+    end
+    reaper.ImGui_SameLine(ctx)
+    local changed, val = reaper.ImGui_Checkbox(ctx, "Export audio", export_enabled)
+    if changed then export_enabled = val end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      reaper.ImGui_SetTooltip(ctx, "This will put audio items onto the track below, so you can rearrange them after recording")
     end
 
     -- Forward keyboard shortcuts to REAPER when window has focus
@@ -976,6 +1139,7 @@ local function imgui_loop()
     reaper.defer(imgui_loop)
   else
     script_running = false
+    uninstall_startup()
     restore_track_state()
     remove_all_jsfx()
   end
@@ -984,6 +1148,7 @@ end
 -- ─── Start ───────────────────────────────────────────────────────────────────
 
 reaper.atexit(function()
+  uninstall_startup()
   restore_track_state()
   remove_all_jsfx()
 end)
@@ -1003,6 +1168,9 @@ if not next(track_data) then
   end
 end
 
+reaper.Main_OnCommand(40252, 0) -- Record mode: normal
+ensure_mic_track()
 ensure_jsfx_on_tracks()
+install_startup()
 reaper.defer(looper_tick)
 reaper.defer(imgui_loop)

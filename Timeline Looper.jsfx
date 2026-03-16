@@ -5,7 +5,7 @@ options:gmem=timeline_looper, gfx_idle=1
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
 // GMEM LAYOUT (name: "timeline_looper"):
-//   Per-track slot (base = 100 + track_index * 50):
+//   Per-track slot (base = 1000 + track_index * 50):
 //     [base+0]  = rec_start (seconds)
 //     [base+1]  = rec_end (seconds)
 //     [base+2]  = rec_muted (0/1)
@@ -16,20 +16,21 @@ options:gmem=timeline_looper, gfx_idle=1
 //       [pbase+2] = play_muted
 //
 //   Global:
-//     [10 + track_index] = rec buffer: main frames feedback
-//     [20] = export trigger (track_index + 1, 0=none)
-//     [21] = export target track index
-//     [30 + track_index] = crossfade (seconds, from slider)
-//     [40 + track_index] = rec buffer: pre-roll frame count
-//     [50 + track_index] = rec buffer index (0=A, 1=B)
-//     [55 + track_index] = play buffer index (0=A, 1=B)
-//     [60 + track_index] = export buffer index (0=A, 1=B)
-//     [70 + track_index] = play buffer: main frames
-//     [80 + track_index] = play buffer: pre-roll frame count
-//     [90 + track_index] = PDC offset (samples, from Lua)
+//     [0] = export trigger (track_index + 1, 0=none)
+//     [1] = export target track index
+//   Per-track (100-slot spacing, supports up to 100 tracks):
+//     [100 + track_index] = rec buffer: main frames feedback
+//     [200 + track_index] = crossfade (seconds, from slider)
+//     [300 + track_index] = rec buffer: pre-roll frame count
+//     [400 + track_index] = rec buffer index (0=A, 1=B)
+//     [500 + track_index] = play buffer index (0=A, 1=B)
+//     [600 + track_index] = export buffer index (0=A, 1=B)
+//     [700 + track_index] = play buffer: main frames
+//     [800 + track_index] = play buffer: pre-roll frame count
+//     [900 + track_index] = PDC offset (samples, from Lua)
 
 slider1:0<0,127,1>Track Index
-slider2:50<5,1000,1>xfade
+slider2:200<5,1000,1>xfade
 
 @init
 FRAMES_MAX = 2000000; // ~41s at 48kHz
@@ -39,70 +40,87 @@ BUF_A = 0;
 BUF_B = BUF_STRIDE;
 ST_A = BUF_STRIDE * 2;
 ST_B = ST_A + 8;
-freembuf(ST_B + 8);
+PC = ST_B + 8; // Play region cache (max 15 regions * 3 values)
+MAX_PLAY = 15;
+MAX_BLOCK = 2048;
+AUDIO_BASE = 10000; // gmem base for input audio from mic track
+freembuf(PC + MAX_PLAY * 3);
 
 // State per buffer: [0]=total_len, [1]=wpos, [2]=was_in_rec_ext, [3]=pre_roll_len, [4]=main_len, [5]=was_in_main
 i = 0;
 while (i < 8) ( ST_A[i] = 0; ST_B[i] = 0; i += 1; );
-was_playing = 0;
+was_recording = 0;
 has_group = 0;
 
 @block
 blk_pos = play_position;
 blk_sample = 0;
+inp_rp = 0; // read pointer into gmem audio from mic track
 my_track = floor(slider1 + 0.5);
 XFADE = slider2 / 1000;
 PRE_ROLL = XFADE;
 POST_ROLL = XFADE;
-gmem[30 + my_track] = XFADE;
-pdc_smp = gmem[90 + my_track];
+gmem[200 + my_track] = XFADE;
+pdc_smp = gmem[900 + my_track];
 pdc_sec = pdc_smp / srate;
 
-// Read current group for this track
-gm = 100 + my_track * 50;
-rec_s_b = gmem[gm];
-rec_e_b = gmem[gm + 1];
-has_group = (rec_s_b != 0 || rec_e_b != 0) ? 1 : 0;
+// Cache all gmem data for this block (prevents mid-block race with Lua)
+gm = 1000 + my_track * 50;
+c_rec_s = gmem[gm];
+c_rec_e = gmem[gm + 1];
+c_rec_muted = gmem[gm + 2];
+c_n_play = min(floor(gmem[gm + 3]), MAX_PLAY);
+has_group = (c_rec_s != 0 || c_rec_e != 0) ? 1 : 0;
+i = 0;
+while (i < c_n_play) (
+  PC[i * 3]     = gmem[gm + 4 + i * 3];
+  PC[i * 3 + 1] = gmem[gm + 4 + i * 3 + 1];
+  PC[i * 3 + 2] = gmem[gm + 4 + i * 3 + 2];
+  i += 1;
+);
 
 // Determine which buffers are for recording vs playback
-rb = gmem[50 + my_track];
-pb = gmem[55 + my_track];
+rb = gmem[400 + my_track];
+pb = gmem[500 + my_track];
 rb ? ( rec_bb = BUF_B; rst = ST_B; ) : ( rec_bb = BUF_A; rst = ST_A; );
 pb ? ( play_bb = BUF_B; pst = ST_B; ) : ( play_bb = BUF_A; pst = ST_A; );
 
-// Clear rec buffer state on transport start
-play_state > 0 && !was_playing ? (
+// Clear rec buffer state on record start
+play_state >= 5 && !was_recording ? (
   i = 0;
   while (i < 8) ( ST_A[i] = 0; ST_B[i] = 0; i += 1; );
 );
-was_playing = play_state > 0;
+was_recording = play_state >= 5;
 
 // Write rec buffer feedback
 rprl = rst[3];
 rst[2] ? (
-  gmem[10 + my_track] = max(rst[1] - rprl, 0);
+  gmem[100 + my_track] = max(rst[1] - rprl, 0);
 ) : (
-  gmem[10 + my_track] = rst[4];
+  gmem[100 + my_track] = rst[4];
 );
-gmem[40 + my_track] = rst[3];
+gmem[300 + my_track] = rst[3];
 
 // Write play buffer feedback
-gmem[70 + my_track] = pst[4];
-gmem[80 + my_track] = pst[3];
+gmem[700 + my_track] = pst[4];
+gmem[800 + my_track] = pst[3];
 
 @sample
 pos = blk_pos + blk_sample / srate;
 blk_sample += 1;
 
+// Read input audio from mic track (written by input JSFX via gmem)
+in0 = gmem[AUDIO_BASE + inp_rp];
+in1 = gmem[AUDIO_BASE + inp_rp + 1];
+inp_rp += 2;
+
 in_play = 0;
 
-play_state > 0 && has_group ? (
-  gm = 100 + my_track * 50;
-
-  rec_s = gmem[gm];
-  rec_e = gmem[gm + 1];
-  rec_muted = gmem[gm + 2];
-  n_play = gmem[gm + 3];
+play_state >= 5 && has_group ? (
+  rec_s = c_rec_s;
+  rec_e = c_rec_e;
+  rec_muted = c_rec_muted;
+  n_play = c_n_play;
 
   // --- Recording (into rec buffer) ---
   // Use PDC-corrected position so buffer content aligns with real transport time
@@ -126,8 +144,8 @@ play_state > 0 && has_group ? (
 
   wp = rst[1];
   in_rec_ext && wp < FRAMES_MAX ? (
-    rec_bb[wp * 2] = spl0;
-    rec_bb[wp * 2 + 1] = spl1;
+    rec_bb[wp * 2] = in0;
+    rec_bb[wp * 2 + 1] = in1;
     rst[1] = wp + 1;
   );
 
@@ -163,10 +181,10 @@ play_state > 0 && has_group ? (
     mix1 = 0;
     pj = 0;
     while (pj < n_play) (
-      pm = gm + 4 + pj * 3;
-      ps = gmem[pm];
-      pe = gmem[pm + 1];
-      p_flags = floor(gmem[pm + 2]);
+      pm = pj * 3;
+      ps = PC[pm];
+      pe = PC[pm + 1];
+      p_flags = floor(PC[pm + 2]);
       p_muted = p_flags & 1;
       p_reverse = (p_flags >> 1) & 1;
 
@@ -224,7 +242,7 @@ play_state > 0 && has_group ? (
 );
 
 // Always mute input pass-through (monitoring handled externally)
-has_group && !in_play ? (
+!in_play ? (
   spl0 = 0;
   spl1 = 0;
 );
@@ -233,16 +251,16 @@ has_group && !in_play ? (
 gfx_setfont(1, "Arial", 14);
 
 // Handle export trigger
-export_trk = gmem[20];
+export_trk = gmem[0];
 export_trk > 0 && (export_trk - 1) == floor(slider1 + 0.5) ? (
-  eb = gmem[60 + my_track]; // which buffer to export
+  eb = gmem[600 + my_track]; // which buffer to export
   eb ? ( exp_bb = BUF_B; exp_st = ST_B; ) : ( exp_bb = BUF_A; exp_st = ST_A; );
   eml = exp_st[4];
   etl = exp_st[0];
   eml > 0 && etl > 0 ? (
-    export_buffer_to_project(exp_bb, etl, 2, srate, gmem[21], 0);
+    export_buffer_to_project(exp_bb, etl, 2, srate, gmem[1], 0);
   );
-  gmem[20] = 0;
+  gmem[0] = 0;
 );
 
 // Line 1: Status

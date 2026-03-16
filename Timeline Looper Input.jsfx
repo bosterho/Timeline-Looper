@@ -1,0 +1,19 @@
+desc:Ostertoaster Timeline Looper Input
+//tags:looper recording
+options:gmem=timeline_looper
+// Captures input audio and writes to gmem for all Timeline Looper JSFX instances.
+// Place on a single "mic" track's input FX chain. No monitoring needed.
+
+@init
+MAX_BLOCK = 2048;
+AUDIO_BASE = 10000;
+
+@block
+wp = 0;
+
+@sample
+wp < MAX_BLOCK * 2 ? (
+  gmem[AUDIO_BASE + wp] = spl0;
+  gmem[AUDIO_BASE + wp + 1] = spl1;
+  wp += 2;
+);

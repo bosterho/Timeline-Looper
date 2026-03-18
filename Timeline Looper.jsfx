@@ -1,6 +1,6 @@
 desc:Ostertoaster Timeline Looper
 //tags:looper recording
-options:gmem=timeline_looper, gfx_idle=1
+options:gmem=timeline_looper, gfx_idle=1, maxchan=16
 // Double-buffered looper: records into one buffer while playing from another.
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
@@ -29,6 +29,7 @@ options:gmem=timeline_looper, gfx_idle=1
 //     [700 + track_index] = play buffer: main frames
 //     [800 + track_index] = play buffer: pre-roll frame count
 //     [900 + track_index] = PDC offset (samples, from Lua)
+//     [950 + track_index] = multi-channel mode (1=per-clip channels, 0=mix to ch 0-1)
 //   Per-play-clip volume envelope (base = 5000 + track_index * 200 + clip_j * 9):
 //     [base+0]  = num_points (0-4)
 //     [base+1..8] = pairs of (time_relative_to_play_start, value)
@@ -74,6 +75,7 @@ POST_ROLL = XFADE;
 gmem[200 + my_track] = XFADE;
 pdc_smp = gmem[900 + my_track];
 pdc_sec = pdc_smp / srate;
+multichan = gmem[950 + my_track]; // 1 = per-clip channels, 0 = mix to ch 0-1
 
 // Cache all gmem data for this block (prevents mid-block race with Lua)
 gm = 1000 + my_track * 100;
@@ -207,9 +209,13 @@ play_state >= 5 && has_group ? (
   fi_smp = PRE_ROLL * srate;
   fo_smp = POST_ROLL * srate;
 
+  // Zero all output channels (up to 16 = 8 stereo clip pairs)
+  spl0 = 0; spl1 = 0; spl2 = 0; spl3 = 0;
+  spl4 = 0; spl5 = 0; spl6 = 0; spl7 = 0;
+  spl8 = 0; spl9 = 0; spl10 = 0; spl11 = 0;
+  spl12 = 0; spl13 = 0; spl14 = 0; spl15 = 0;
+
   pml > 0 ? (
-    mix0 = 0;
-    mix1 = 0;
     pj = 0;
     while (pj < n_play) (
       pm = pj * 4;
@@ -283,14 +289,13 @@ play_state >= 5 && has_group ? (
         em = pj * 9;
         e_n = EC[em];
         e_n > 0 ? (
-          env_t = (ppos - ps) * p_rate; // time in take source time (scaled by playrate)
-          // Linear interpolation between envelope points
+          env_t = (ppos - ps) * p_rate;
           env_t <= EC[em + 1] ? (
-            env_g = EC[em + 2]; // before first point: use first value
+            env_g = EC[em + 2];
           ) : env_t >= EC[em + 1 + (e_n - 1) * 2] ? (
-            env_g = EC[em + 2 + (e_n - 1) * 2]; // after last point: use last value
+            env_g = EC[em + 2 + (e_n - 1) * 2];
           ) : (
-            env_g = EC[em + 2]; // default
+            env_g = EC[em + 2];
             ei = 1;
             while (ei < e_n) (
               ei_t = EC[em + 1 + ei * 2];
@@ -299,7 +304,7 @@ play_state >= 5 && has_group ? (
                 p0_v = EC[em + 2 + (ei - 1) * 2];
                 p1_v = EC[em + 2 + ei * 2];
                 env_g = p0_v + (p1_v - p0_v) * (env_t - p0_t) / max(ei_t - p0_t, 0.0001);
-                ei = e_n; // break
+                ei = e_n;
               );
               ei += 1;
             );
@@ -327,33 +332,35 @@ play_state >= 5 && has_group ? (
                 pp0_v = PEC[pem + 2 + (pi - 1) * 2];
                 pp1_v = PEC[pem + 2 + pi * 2];
                 pan_v = pp0_v + (pp1_v - pp0_v) * (pan_t - pp0_t) / max(pi_t - pp0_t, 0.0001);
-                pi = pe_n; // break
+                pi = pe_n;
               );
               pi += 1;
             );
           );
-          // Stereo balance: pan_v in -1..1 (negative=left, positive=right)
           out0 *= min(1, 1 + pan_v);
           out1 *= min(1, 1 - pan_v);
         );
 
-        mix0 += out0;
-        mix1 += out1;
+        // Output: multi-channel mode sends each clip to its own stereo pair
+        // Mix mode sums everything to ch 0-1
+        multichan && pj < 8 ? (
+          ch = pj * 2;
+          ch == 0  ? ( spl0  += out0; spl1  += out1; ) :
+          ch == 2  ? ( spl2  += out0; spl3  += out1; ) :
+          ch == 4  ? ( spl4  += out0; spl5  += out1; ) :
+          ch == 6  ? ( spl6  += out0; spl7  += out1; ) :
+          ch == 8  ? ( spl8  += out0; spl9  += out1; ) :
+          ch == 10 ? ( spl10 += out0; spl11 += out1; ) :
+          ch == 12 ? ( spl12 += out0; spl13 += out1; ) :
+          ch == 14 ? ( spl14 += out0; spl15 += out1; );
+        ) : (
+          spl0 += out0; spl1 += out1;
+        );
         in_play = 1;
       );
       pj += 1;
     );
-    in_play ? (
-      spl0 = mix0;
-      spl1 = mix1;
-    );
   );
-);
-
-// Always mute input pass-through (monitoring handled externally)
-!in_play ? (
-  spl0 = 0;
-  spl1 = 0;
 );
 
 @gfx 300 40

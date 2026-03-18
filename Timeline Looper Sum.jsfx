@@ -1,0 +1,12 @@
+desc:Ostertoaster Timeline Looper Sum
+//tags:utility mixer
+// Sums channels 2-15 into channels 0-1 (used after per-clip FX processing)
+options:maxchan=16
+
+@sample
+spl0 += spl2 + spl4 + spl6 + spl8 + spl10 + spl12 + spl14;
+spl1 += spl3 + spl5 + spl7 + spl9 + spl11 + spl13 + spl15;
+spl2 = 0; spl3 = 0; spl4 = 0; spl5 = 0;
+spl6 = 0; spl7 = 0; spl8 = 0; spl9 = 0;
+spl10 = 0; spl11 = 0; spl12 = 0; spl13 = 0;
+spl14 = 0; spl15 = 0;

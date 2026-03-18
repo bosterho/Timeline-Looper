@@ -3,6 +3,7 @@
 -- @version 1.0
 -- @provides
 --   [effect] Ostertoaster/Timeline Looper.jsfx
+--   [effect] Ostertoaster/Timeline Looper Sum.jsfx
 -- @about
 --   Timeline looper for REAPER. Place red "rec" and green "play" MIDI items
 --   on a track to define recording and playback regions. The companion JSFX plugin
@@ -79,6 +80,7 @@ local POST_ROLL = 0.05
 local last_play_state = reaper.GetPlayState()
 local was_recording = false
 local export_enabled = true
+local was_mouse_down = false
 
 -- Per-track data: keyed by track pointer
 --   .groups = ordered list of { rec_item, play_items={}, track }
@@ -196,7 +198,7 @@ do
   local script_dir = info.source:match("@?(.*[\\/])")
   local dst_dir = reaper.GetResourcePath() .. "/Effects/Ostertoaster"
   reaper.RecursiveCreateDirectory(dst_dir, 0)
-  for _, name in ipairs({"Timeline Looper.jsfx", "Timeline Looper Input.jsfx"}) do
+  for _, name in ipairs({"Timeline Looper.jsfx", "Timeline Looper Input.jsfx", "Timeline Looper Sum.jsfx"}) do
     local f_in = io.open(script_dir .. name, "rb")
     if f_in then
       local content = f_in:read("*a")
@@ -209,8 +211,16 @@ end
 
 local JSFX_ADD_NAME = "JS:Ostertoaster/Timeline Looper"
 local INPUT_JSFX_NAME = "JS:Ostertoaster/Timeline Looper Input"
+local SUM_JSFX_NAME = "JS:Ostertoaster/Timeline Looper Sum"
+local MAX_FX_SLOTS = 8 -- max per-clip FX channel pairs (matches JSFX spl0-spl15)
+local FX_BYPASS_MARGIN = 0.5 -- enable FX this many seconds before clip starts / after clip ends
 local jsfx_managed = {}
 local mic_track = nil -- single mic track for input capture
+-- Per-track FX container state: keyed by track pointer
+--   .container_idx = FX index of container on track (-1 if none)
+--   .chain_fingerprints = { [slot] = "fp_string" } -- what's currently mirrored
+--   .chain_enabled = { [slot] = bool } -- bypass state
+local fx_container_state = {}
 
 local function find_input_jsfx(track)
   -- Search regular FX chain
@@ -232,42 +242,69 @@ local function find_input_jsfx(track)
   return -1
 end
 
-local function ensure_mic_track()
-  -- Find existing mic track (has input JSFX on regular FX chain)
-  local num_tracks = reaper.CountTracks(0)
-  for t = 0, num_tracks - 1 do
+local function find_mic_track_by_guid()
+  local _, guid = reaper.GetProjExtState(0, EXTSTATE_SECTION, "mic_track_guid")
+  if not guid or guid == "" then return nil end
+  for t = 0, reaper.CountTracks(0) - 1 do
     local track = reaper.GetTrack(0, t)
-    if find_input_jsfx(track) >= 0 then
-      mic_track = track
-      -- Re-arm and monitor in case cleanup disabled them
-      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
-      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
-      reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2) -- disable recording, monitor only
-      reaper.SetMediaTrackInfo_Value(mic_track, "B_MAINSEND", 0)
-      return mic_track
+    local tguid = reaper.GetTrackGUID(track)
+    if tguid == guid then return track end
+  end
+  return nil
+end
+
+local function save_mic_track_guid(track)
+  local guid = reaper.GetTrackGUID(track)
+  reaper.SetProjExtState(0, EXTSTATE_SECTION, "mic_track_guid", guid)
+end
+
+local function ensure_mic_track()
+  -- Find existing mic track by saved GUID first, then fall back to JSFX detection
+  mic_track = find_mic_track_by_guid()
+  if not mic_track then
+    local num_tracks = reaper.CountTracks(0)
+    for t = 0, num_tracks - 1 do
+      local track = reaper.GetTrack(0, t)
+      if find_input_jsfx(track) >= 0 then
+        mic_track = track
+        break
+      end
     end
   end
+
+  if mic_track then
+    -- Ensure Input JSFX is on the track (may have been removed on cleanup)
+    if find_input_jsfx(mic_track) < 0 then
+      reaper.TrackFX_AddByName(mic_track, INPUT_JSFX_NAME, false, -1)
+    end
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
+    reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2)
+    reaper.SetMediaTrackInfo_Value(mic_track, "B_MAINSEND", 0)
+    save_mic_track_guid(mic_track)
+    return mic_track
+  end
+
   -- Create mic track at position 0
+  reaper.PreventUIRefresh(1)
   reaper.InsertTrackAtIndex(0, false)
   mic_track = reaper.GetTrack(0, 0)
   reaper.GetSetMediaTrackInfo_String(mic_track, "P_NAME", "Mic", true)
   reaper.SetMediaTrackInfo_Value(mic_track, "I_CUSTOMCOLOR", reaper.ColorToNative(0xDE, 0x83, 0x83) | 0x1000000)
-  -- Add input JSFX to regular FX chain (unmuting the track feeds audio to master)
   local fx_idx = reaper.TrackFX_AddByName(mic_track, INPUT_JSFX_NAME, false, -1)
   if fx_idx < 0 then
     reaper.ShowMessageBox("Could not add Timeline Looper Input JSFX", SCRIPT_NAME, 0)
   end
-  -- Arm + monitor so input signal flows through the FX chain, but don't record to disk
   reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
   reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
-  reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2) -- disable recording, monitor only
-  -- Set to stereo audio input 1/2 if no input set
+  reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2)
   local cur_input = reaper.GetMediaTrackInfo_Value(mic_track, "I_RECINPUT")
   if cur_input < 0 or cur_input >= 4096 then
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECINPUT", 1024)
   end
-  -- Disable master send so it doesn't output to master (enable to hear input)
   reaper.SetMediaTrackInfo_Value(mic_track, "B_MAINSEND", 0)
+  save_mic_track_guid(mic_track)
+  reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
   reaper.UpdateArrange()
   return mic_track
@@ -277,12 +314,35 @@ local function cleanup_mic_track()
   if mic_track and reaper.ValidatePtr(mic_track, "MediaTrack*") then
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 0)
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 0)
+    -- Remove the Input JSFX
+    local fx = find_input_jsfx(mic_track)
+    if fx >= 0 then
+      reaper.TrackFX_Delete(mic_track, fx)
+    end
   end
   mic_track = nil
 end
 
+-- Remove all mirrored FX from a track (everything after the JSFX at index 0)
+local function remove_mirrored_fx(track)
+  for i = reaper.TrackFX_GetCount(track) - 1, 1, -1 do
+    reaper.TrackFX_Delete(track, i)
+  end
+  fx_container_state[track] = nil
+end
+
 local function restore_track_state()
   cleanup_mic_track()
+  -- Remove mirrored FX from all JSFX tracks and reset channel counts
+  reaper.PreventUIRefresh(1)
+  for track in pairs(fx_container_state) do
+    if reaper.ValidatePtr(track, "MediaTrack*") then
+      remove_mirrored_fx(track)
+      reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+    end
+  end
+  fx_container_state = {}
+  reaper.PreventUIRefresh(-1)
 end
 
 local function find_jsfx(track)
@@ -296,7 +356,125 @@ local function find_jsfx(track)
   return -1
 end
 
+-- ─── Item FX mirroring (per-clip FX on track chain with pin routing) ──────
+
+-- Build a fingerprint of FX names only (structural changes trigger rebuild)
+local function get_item_fx_fingerprint(item)
+  local take = reaper.GetActiveTake(item)
+  if not take then return nil end
+  local count = reaper.TakeFX_GetCount(take)
+  if count == 0 then return nil end
+  local parts = {}
+  for i = 0, count - 1 do
+    local _, name = reaper.TakeFX_GetFXName(take, i, "")
+    parts[#parts + 1] = name or "?"
+  end
+  return table.concat(parts, "|")
+end
+
+-- Sync parameter values and envelopes from take FX to mirrored track FX
+-- Hash envelope points into a compact string for change detection
+local function hash_envelope(env, n_pts)
+  if n_pts == 0 then return "" end
+  local parts = {}
+  for i = 0, n_pts - 1 do
+    local _, t, v, sh, tn = reaper.GetEnvelopePoint(env, i)
+    parts[#parts + 1] = string.format("%.6f:%.6f:%d:%.4f", t, v, sh, tn)
+  end
+  return table.concat(parts, ",")
+end
+
+local function sync_fx_params(track, play_items)
+  local state = fx_container_state[track]
+  if not state or not state.slot_fx_indices then return end
+  if not state.env_hashes then state.env_hashes = {} end
+
+  -- Defer sync while left mouse button is held (user dragging envelope/slider)
+  if reaper.JS_Mouse_GetState and reaper.JS_Mouse_GetState(1) ~= 0 then return end
+
+  for slot, info in pairs(state.slot_fx_indices) do
+    local item = play_items[slot + 1]
+    if not item then goto next_slot end
+    local take = reaper.GetActiveTake(item)
+    if not take then goto next_slot end
+
+    local play_start = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local play_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if playrate <= 0 then playrate = 1.0 end
+
+    local take_fx_count = reaper.TakeFX_GetCount(take)
+    for fi = 0, take_fx_count - 1 do
+      local track_fx_idx = info.first + fi
+      if track_fx_idx >= reaper.TrackFX_GetCount(track) then break end
+
+      -- Sync static parameter values (skip params with take envelopes and
+      -- skip the Bypass param — bypass is managed by update_fx_bypass)
+      local np = reaper.TakeFX_GetNumParams(take, fi)
+      for p = 0, np - 1 do
+        local _, pname = reaper.TakeFX_GetParamName(take, fi, p, "")
+        if pname ~= "Bypass" then
+          local take_env = reaper.TakeFX_GetEnvelope(take, fi, p, false)
+          if not take_env or reaper.CountEnvelopePoints(take_env) == 0 then
+            local tv = reaper.TakeFX_GetParam(take, fi, p)
+            local fv = reaper.TrackFX_GetParam(track, track_fx_idx, p)
+            if math.abs(tv - fv) > 0.0001 then
+              reaper.TrackFX_SetParam(track, track_fx_idx, p, tv)
+            end
+          end
+        end
+      end
+
+      -- Sync take FX parameter envelopes (only when changed)
+      local hash_key = slot .. ":" .. fi
+      if not state.env_hashes[hash_key] then state.env_hashes[hash_key] = {} end
+
+      for p = 0, np - 1 do
+        local take_env = reaper.TakeFX_GetEnvelope(take, fi, p, false)
+        local take_pts = take_env and reaper.CountEnvelopePoints(take_env) or 0
+        local new_hash = take_env and hash_envelope(take_env, take_pts) or ""
+
+        if new_hash ~= (state.env_hashes[hash_key][p] or "") then
+          state.env_hashes[hash_key][p] = new_hash
+
+          if take_pts > 0 then
+            local track_env = reaper.GetFXEnvelope(track, track_fx_idx, p, true)
+            if track_env then
+              -- Hide the track envelope lane (active but invisible)
+              local _, echunk = reaper.GetEnvelopeStateChunk(track_env, "", false)
+              if echunk:find("VIS 1") then
+                echunk = echunk:gsub("VIS 1", "VIS 0")
+                reaper.SetEnvelopeStateChunk(track_env, echunk, false)
+              end
+              local env_start = play_start - 0.01
+              local env_end = play_start + play_len + 0.01
+              reaper.DeleteEnvelopePointRange(track_env, env_start, env_end)
+              for pt = 0, take_pts - 1 do
+                local _, pt_time, pt_val, pt_shape, pt_tension = reaper.GetEnvelopePoint(take_env, pt)
+                local proj_time = play_start + pt_time / playrate
+                if proj_time <= play_start + play_len then
+                  reaper.InsertEnvelopePoint(track_env, proj_time, pt_val, pt_shape, pt_tension, false, true)
+                end
+              end
+              reaper.Envelope_SortPoints(track_env)
+            end
+          else
+            local track_env = reaper.GetFXEnvelope(track, track_fx_idx, p, false)
+            if track_env then
+              local env_start = play_start - 0.01
+              local env_end = play_start + play_len + 0.01
+              reaper.DeleteEnvelopePointRange(track_env, env_start, env_end)
+            end
+          end
+        end
+      end
+    end
+    ::next_slot::
+  end
+end
+
 local function remove_all_jsfx()
+  reaper.PreventUIRefresh(1)
   local num_tracks = reaper.CountTracks(0)
   for t = 0, num_tracks - 1 do
     local track = reaper.GetTrack(0, t)
@@ -304,11 +482,143 @@ local function remove_all_jsfx()
       local _, name = reaper.TrackFX_GetFXName(track, i, "")
       if name and name:lower():find("timeline looper")
         and not name:lower():find("timeline looper input") then
-        reaper.TrackFX_Delete(track, i)
+        -- Delete this and everything after it (mirrored FX)
+        for j = reaper.TrackFX_GetCount(track) - 1, i, -1 do
+          reaper.TrackFX_Delete(track, j)
+        end
+        break
+      end
+    end
+    -- Reset channel count
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+  end
+  jsfx_managed = {}
+  fx_container_state = {}
+  reaper.PreventUIRefresh(-1)
+end
+
+-- Set pin mappings on a track FX so it reads from and outputs to a specific
+-- stereo channel pair (keeps each clip's audio on its own pair)
+local function set_fx_pin_mappings(track, fx_idx, clip_slot)
+  local ch = clip_slot * 2 -- channel pair (0-based)
+  reaper.TrackFX_SetPinMappings(track, fx_idx, 0, 0, 1 << ch, 0)       -- in L
+  reaper.TrackFX_SetPinMappings(track, fx_idx, 0, 1, 1 << (ch + 1), 0) -- in R
+  reaper.TrackFX_SetPinMappings(track, fx_idx, 1, 0, 1 << ch, 0)       -- out L
+  reaper.TrackFX_SetPinMappings(track, fx_idx, 1, 1, 1 << (ch + 1), 0) -- out R
+end
+
+-- Sync mirrored FX on a track based on its current play clips.
+-- Places take FX copies as individual track FX after the JSFX, each with
+-- pin mappings to process only its clip's stereo channel pair.
+-- Called during scan (every ~1s), not every tick.
+local function sync_fx_container(track, play_items)
+  local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
+  if not play_items or #play_items == 0 then
+    remove_mirrored_fx(track)
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+    reaper.gmem_write(950 + track_idx, 0)
+    return
+  end
+
+  -- Check if any play item has take FX
+  local any_fx = false
+  for _, item in ipairs(play_items) do
+    if get_item_fx_fingerprint(item) then any_fx = true; break end
+  end
+
+  if not any_fx then
+    remove_mirrored_fx(track)
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+    reaper.gmem_write(950 + track_idx, 0)
+    return
+  end
+
+  -- Build the new fingerprint map
+  local new_fps = {}
+  local max_slots = math.min(#play_items, MAX_FX_SLOTS)
+  for slot = 0, max_slots - 1 do
+    new_fps[slot] = get_item_fx_fingerprint(play_items[slot + 1])
+  end
+
+  -- Check if anything changed
+  local state = fx_container_state[track]
+  if state then
+    local changed = false
+    for slot = 0, max_slots - 1 do
+      if state.chain_fingerprints[slot] ~= new_fps[slot] then changed = true; break end
+    end
+    -- Also check if slot count changed
+    if not changed then
+      for slot in pairs(state.chain_fingerprints) do
+        if slot >= max_slots then changed = true; break end
+      end
+    end
+    if not changed then
+      -- No FX changes, just ensure multichan mode
+      reaper.gmem_write(950 + track_idx, 1)
+      return
+    end
+  end
+
+  -- Rebuild: remove old mirrored FX, re-add
+  reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 16)
+  remove_mirrored_fx(track)
+
+  state = { chain_fingerprints = {}, chain_enabled = {}, slot_fx_indices = {}, needs_sync = true }
+  fx_container_state[track] = state
+
+  -- For each clip slot with take FX, copy the FX to the track chain
+  for slot = 0, max_slots - 1 do
+    local item = play_items[slot + 1]
+    local take = reaper.GetActiveTake(item)
+    if take and reaper.TakeFX_GetCount(take) > 0 then
+      local fx_count = reaper.TakeFX_GetCount(take)
+      local first_fx_idx = reaper.TrackFX_GetCount(track)
+      -- Copy each take FX to the end of the track chain
+      for fi = 0, fx_count - 1 do
+        local dest = reaper.TrackFX_GetCount(track)
+        reaper.TakeFX_CopyToTrack(take, fi, track, dest, false)
+      end
+      -- Set pin mappings on all FX in this slot to their clip's channel pair
+      for fi = first_fx_idx, first_fx_idx + fx_count - 1 do
+        set_fx_pin_mappings(track, fi, slot)
+      end
+      state.chain_fingerprints[slot] = new_fps[slot]
+      state.chain_enabled[slot] = false
+      state.slot_fx_indices[slot] = { first = first_fx_idx, count = fx_count }
+      -- Start bypassed
+      for fi = first_fx_idx, first_fx_idx + fx_count - 1 do
+        reaper.TrackFX_SetEnabled(track, fi, false)
       end
     end
   end
-  jsfx_managed = {}
+
+  -- Add summing JSFX at the end (sums ch 2-15 into ch 0-1)
+  local sum_idx = reaper.TrackFX_AddByName(track, SUM_JSFX_NAME, false, -1)
+  if sum_idx >= 0 then
+    state.sum_fx_idx = sum_idx
+  end
+
+  reaper.gmem_write(950 + track_idx, 1)
+end
+
+-- Enable/disable mirrored FX based on which clips are currently active
+local function update_fx_bypass(track, active_clips)
+  local state = fx_container_state[track]
+  if not state then return end
+
+  for slot = 0, MAX_FX_SLOTS - 1 do
+    local slot_info = state.slot_fx_indices and state.slot_fx_indices[slot]
+    if slot_info then
+      local should_enable = active_clips[slot] or false
+      if state.chain_enabled[slot] ~= should_enable then
+        for fi = slot_info.first, slot_info.first + slot_info.count - 1 do
+          reaper.TrackFX_SetEnabled(track, fi, should_enable)
+        end
+        state.chain_enabled[slot] = should_enable
+      end
+    end
+  end
 end
 
 -- Find the audio sibling track (same parent folder as JSFX track, no JSFX on it)
@@ -338,12 +648,12 @@ local function ensure_track_hierarchy(jsfx_track)
   local audio = find_audio_sibling(jsfx_track)
   if audio then return audio end
 
+  reaper.PreventUIRefresh(1)
   local jsfx_idx = reaper.GetMediaTrackInfo_Value(jsfx_track, "IP_TRACKNUMBER") - 1
   local jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
   local parent = reaper.GetParentTrack(jsfx_track)
 
   if not parent then
-    -- Create parent folder above the JSFX track
     reaper.InsertTrackAtIndex(jsfx_idx, false)
     parent = reaper.GetTrack(0, jsfx_idx)
     reaper.SetMediaTrackInfo_Value(parent, "I_FOLDERDEPTH", 1)
@@ -351,16 +661,15 @@ local function ensure_track_hierarchy(jsfx_track)
     reaper.GetSetMediaTrackInfo_String(parent, "P_NAME", jsfx_name or "Looper", true)
     reaper.SetMediaTrackInfo_Value(parent, "I_CUSTOMCOLOR", reaper.ColorToNative(0x83, 0xB7, 0xDE) | 0x1000000)
     reaper.GetSetMediaTrackInfo_String(jsfx_track, "P_NAME", "JSFX", true)
-    -- Refresh after insertion
     jsfx_idx = reaper.GetMediaTrackInfo_Value(jsfx_track, "IP_TRACKNUMBER") - 1
     jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
   end
 
-  -- If JSFX track was a folder parent (old setup), flatten to regular child
   if jsfx_depth == 1 then
     reaper.SetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH", 0)
     audio = find_audio_sibling(jsfx_track)
     if audio then
+      reaper.PreventUIRefresh(-1)
       reaper.TrackList_AdjustWindows(false)
       reaper.UpdateArrange()
       return audio
@@ -369,8 +678,6 @@ local function ensure_track_hierarchy(jsfx_track)
     jsfx_depth = reaper.GetMediaTrackInfo_Value(jsfx_track, "I_FOLDERDEPTH")
   end
 
-  -- Insert audio sibling after the JSFX track
-  -- Transfer any folder-closing depth from JSFX to the new audio track
   local audio_depth = -1
   if jsfx_depth < 0 then
     audio_depth = jsfx_depth
@@ -380,12 +687,14 @@ local function ensure_track_hierarchy(jsfx_track)
   audio = reaper.GetTrack(0, jsfx_idx + 1)
   reaper.SetMediaTrackInfo_Value(audio, "I_FOLDERDEPTH", audio_depth)
   reaper.GetSetMediaTrackInfo_String(audio, "P_NAME", "Audio", true)
+  reaper.PreventUIRefresh(-1)
   reaper.TrackList_AdjustWindows(false)
   reaper.UpdateArrange()
   return audio
 end
 
 local function ensure_jsfx_on_tracks()
+  reaper.PreventUIRefresh(1)
   for track in pairs(track_data) do
     -- Ensure parent folder + audio sibling FIRST (may shift track indices)
     ensure_track_hierarchy(track)
@@ -426,6 +735,7 @@ local function ensure_jsfx_on_tracks()
     local perf = reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
     reaper.SetMediaTrackInfo_Value(track, "I_PERFFLAGS", perf | 2)
   end
+  reaper.PreventUIRefresh(-1)
 end
 
 -- ─── gmem sync (Lua → JSFX) ─────────────────────────────────────────────────
@@ -556,6 +866,7 @@ local function clear_group_audio(group)
     ranges[#ranges + 1] = { ps - PRE_ROLL, ps + get_item_len(play_item) + POST_ROLL }
   end
   local changed = false
+  reaper.PreventUIRefresh(1)
   for i = reaper.CountTrackMediaItems(audio_track) - 1, 0, -1 do
     local item = reaper.GetTrackMediaItem(audio_track, i)
     local take = reaper.GetActiveTake(item)
@@ -570,6 +881,7 @@ local function clear_group_audio(group)
       end
     end
   end
+  reaper.PreventUIRefresh(-1)
   if changed then reaper.UpdateArrange() end
 end
 
@@ -812,11 +1124,60 @@ local function place_play_item_audio(audio_track, play_item, ep)
       reaper.SetMediaItemInfo_Value(item, "I_GROUPID", group_id)
     end
   end
-  -- Copy item envelopes from play clip to exported audio items
+  -- Copy item envelopes and take FX from play clip to exported audio items
+  local src_take = reaper.GetActiveTake(play_item)
+  local src_fx_count = src_take and reaper.TakeFX_GetCount(src_take) or 0
   for ci, item in ipairs(items) do
     local src_offset = (ci - 1) * eff_rec - eff_pre
     local dst_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
     copy_item_envelopes(play_item, item, src_offset, dst_length)
+    -- Copy take FX chain and their parameter envelopes (sliced per loop copy)
+    if src_fx_count > 0 then
+      local dst_take = reaper.GetActiveTake(item)
+      if dst_take then
+        for fi = 0, src_fx_count - 1 do
+          reaper.TakeFX_CopyToTake(src_take, fi, dst_take, fi, false)
+          -- Slice FX parameter envelopes to this copy's time window
+          local np = reaper.TakeFX_GetNumParams(src_take, fi)
+          for p = 0, np - 1 do
+            local src_env = reaper.TakeFX_GetEnvelope(src_take, fi, p, false)
+            if src_env and reaper.CountEnvelopePoints(src_env) > 0 then
+              -- Collect source points
+              local pts = {}
+              for pt = 0, reaper.CountEnvelopePoints(src_env) - 1 do
+                local _, pt_t, pt_v, pt_sh, pt_tn, pt_sel = reaper.GetEnvelopePoint(src_env, pt)
+                pts[#pts + 1] = { t = pt_t, v = pt_v, sh = pt_sh, tn = pt_tn, sel = pt_sel }
+              end
+              -- Time window in source time for this loop copy
+              local win_start = src_offset * playrate
+              local win_end = win_start + dst_length * playrate
+              -- Build sliced points
+              local dst_env = reaper.TakeFX_GetEnvelope(dst_take, fi, p, true)
+              if dst_env then
+                -- Interpolated boundary at window start
+                if #pts > 0 and pts[1].t < win_start then
+                  local v = lerp_env_value(win_start, pts)
+                  reaper.InsertEnvelopePoint(dst_env, 0, v, 0, 0, false, true)
+                end
+                -- Points within window, shifted to dst time
+                for _, pt in ipairs(pts) do
+                  if pt.t >= win_start - 0.001 and pt.t <= win_end + 0.001 then
+                    local dst_t = math.max(0, (pt.t - win_start) / playrate)
+                    reaper.InsertEnvelopePoint(dst_env, dst_t, pt.v, pt.sh, pt.tn, pt.sel, true)
+                  end
+                end
+                -- Interpolated boundary at window end
+                if #pts > 0 and pts[#pts].t > win_end then
+                  local v = lerp_env_value(win_end, pts)
+                  reaper.InsertEnvelopePoint(dst_env, dst_length, v, 0, 0, false, true)
+                end
+                reaper.Envelope_SortPoints(dst_env)
+              end
+            end
+          end
+        end
+      end
+    end
   end
 end
 
@@ -989,14 +1350,77 @@ local function looper_tick()
           reaper.SetProjExtState(0, EXTSTATE_SECTION, "xfade_" .. idx, tostring(xf))
         end
         reaper.gmem_write(900 + idx, get_pdc_samples(track))
+        -- Sync item FX for ALL play clips across ALL groups on this track
+        local td = track_data[track]
+        if td then
+          local all_play_items = {}
+          for _, g in ipairs(td.groups) do
+            for _, pi in ipairs(g.play_items) do
+              all_play_items[#all_play_items + 1] = pi
+            end
+          end
+          reaper.PreventUIRefresh(1)
+          sync_fx_container(track, all_play_items)
+          sync_fx_params(track, all_play_items)
+          reaper.PreventUIRefresh(-1)
+        end
       end
     end
     last_scan_time = now
   end
 
+  -- Detect mouse-up → force immediate param sync (outside normal scan interval)
+  local mouse_down = reaper.JS_Mouse_GetState and reaper.JS_Mouse_GetState(1) ~= 0
+  if was_mouse_down and not mouse_down then
+    reaper.PreventUIRefresh(1)
+    for track in pairs(jsfx_managed) do
+      if reaper.ValidatePtr(track, "MediaTrack*") then
+        local td = track_data[track]
+        if td then
+          local all_play_items = {}
+          for _, g in ipairs(td.groups) do
+            for _, pi in ipairs(g.play_items) do
+              all_play_items[#all_play_items + 1] = pi
+            end
+          end
+          sync_fx_params(track, all_play_items)
+        end
+      end
+    end
+    reaper.PreventUIRefresh(-1)
+  end
+  was_mouse_down = mouse_down
+
   process_export()
 
+  -- Update FX bypass based on cursor/play position (works when stopped, playing, or recording)
   if not is_recording then
+    local pos
+    local cur_play_state = reaper.GetPlayState()
+    if cur_play_state > 0 then
+      pos = reaper.GetPlayPosition()
+    else
+      pos = reaper.GetCursorPosition()
+    end
+    for track, td in pairs(track_data) do
+      if fx_container_state[track] then
+        local active_clips = {}
+        local slot = 0
+        for _, g in ipairs(td.groups) do
+          for _, pi in ipairs(g.play_items) do
+            if slot < MAX_FX_SLOTS and not is_item_muted(pi) then
+              local ps = get_item_pos(pi)
+              local pe = ps + get_item_len(pi)
+              if pos >= ps - PRE_ROLL - FX_BYPASS_MARGIN and pos < pe + POST_ROLL + FX_BYPASS_MARGIN then
+                active_clips[slot] = true
+              end
+            end
+            slot = slot + 1
+          end
+        end
+        update_fx_bypass(track, active_clips)
+      end
+    end
     reaper.defer(looper_tick)
     return
   end
@@ -1162,6 +1586,25 @@ local function looper_tick()
       if any_placed then
         reaper.PreventUIRefresh(-1)
         reaper.UpdateArrange()
+      end
+
+      -- Update FX container bypass based on which play clips are active now
+      if fx_container_state[track] then
+        local active_clips = {}
+        local slot = 0
+        for _, g in ipairs(td.groups) do
+          for _, pi in ipairs(g.play_items) do
+            if slot < MAX_FX_SLOTS and not is_item_muted(pi) then
+              local ps = get_item_pos(pi)
+              local pe = ps + get_item_len(pi)
+              if pos >= ps - PRE_ROLL - FX_BYPASS_MARGIN and pos < pe + POST_ROLL + FX_BYPASS_MARGIN then
+                active_clips[slot] = true
+              end
+            end
+            slot = slot + 1
+          end
+        end
+        update_fx_bypass(track, active_clips)
       end
 
       ::next_track::
@@ -1341,6 +1784,7 @@ reaper.atexit(function()
   remove_all_jsfx()
 end)
 
+reaper.PreventUIRefresh(1)
 remove_all_jsfx()
 scan_all_tracks()
 
@@ -1359,6 +1803,8 @@ end
 reaper.Main_OnCommand(40252, 0) -- Record mode: normal
 ensure_mic_track()
 ensure_jsfx_on_tracks()
+reaper.PreventUIRefresh(-1)
+reaper.UpdateArrange()
 install_startup()
 reaper.defer(looper_tick)
 reaper.defer(imgui_loop)

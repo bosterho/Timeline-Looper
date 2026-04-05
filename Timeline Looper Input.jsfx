@@ -6,7 +6,7 @@ options:gmem=timeline_looper
 
 @init
 MAX_BLOCK = 2048;
-AUDIO_BASE = 10000;
+AUDIO_BASE = 30000; // must match Timeline Looper.jsfx (above envelope regions at 7000+idx*200)
 
 @block
 wp = 0;

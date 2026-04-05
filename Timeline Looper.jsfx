@@ -53,7 +53,7 @@ PC = ST_B + 8; // Play region cache (max 15 regions * 4 values)
 EC = PC + MAX_PLAY * 4; // Volume envelope cache (max 15 regions * 9 values: 1 count + 4 time/val pairs)
 PEC = EC + MAX_PLAY * 9; // Pan envelope cache (same layout as EC)
 MAX_BLOCK = 2048;
-AUDIO_BASE = 10000; // gmem base for input audio from mic track
+AUDIO_BASE = 30000; // gmem base for input audio from mic track (must be above envelope regions)
 ENV_BASE = 5000; // gmem base for volume envelope data per track
 PAN_ENV_BASE = 7000; // gmem base for pan envelope data per track
 freembuf(PEC + MAX_PLAY * 9);

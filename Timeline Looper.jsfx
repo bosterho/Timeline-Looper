@@ -1,6 +1,6 @@
 desc:Ostertoaster Timeline Looper
 //tags:looper recording
-options:gmem=timeline_looper, gfx_idle=1, maxchan=16
+options:gmem=timeline_looper, gfx_idle=1, maxchan=18
 // Double-buffered looper: records into one buffer while playing from another.
 // Lua advances groups and swaps buffers so playback is never interrupted.
 //
@@ -53,7 +53,8 @@ PC = ST_B + 8; // Play region cache (max 15 regions * 4 values)
 EC = PC + MAX_PLAY * 4; // Volume envelope cache (max 15 regions * 9 values: 1 count + 4 time/val pairs)
 PEC = EC + MAX_PLAY * 9; // Pan envelope cache (same layout as EC)
 MAX_BLOCK = 2048;
-AUDIO_BASE = 30000; // gmem base for input audio from mic track (must be above envelope regions)
+MIC_L = 16; // mic input arrives on channels 17/18 (spl16/spl17) via REAPER send
+MIC_R = 17; // high channels are silently discarded if JSFX is not loaded (crash-safe)
 ENV_BASE = 5000; // gmem base for volume envelope data per track
 PAN_ENV_BASE = 7000; // gmem base for pan envelope data per track
 freembuf(PEC + MAX_PLAY * 9);
@@ -67,7 +68,6 @@ has_group = 0;
 @block
 blk_pos = play_position;
 blk_sample = 0;
-inp_rp = 0; // read pointer into gmem audio from mic track
 my_track = floor(slider1 + 0.5);
 XFADE = slider2 / 1000;
 PRE_ROLL = XFADE;
@@ -76,6 +76,7 @@ gmem[200 + my_track] = XFADE;
 pdc_smp = gmem[900 + my_track];
 pdc_sec = pdc_smp / srate;
 multichan = gmem[950 + my_track]; // 1 = per-clip channels, 0 = mix to ch 0-1
+audio_thru = gmem[2]; // 1 = pass live mic input to output during recording
 
 // Cache all gmem data for this block (prevents mid-block race with Lua)
 gm = 1000 + my_track * 100;
@@ -143,10 +144,11 @@ gmem[800 + my_track] = pst[3];
 pos = blk_pos + blk_sample / srate;
 blk_sample += 1;
 
-// Read input audio from mic track (written by input JSFX via gmem)
-in0 = gmem[AUDIO_BASE + inp_rp];
-in1 = gmem[AUDIO_BASE + inp_rp + 1];
-inp_rp += 2;
+// Read input audio from mic track (arrives on channels 17/18 via REAPER send)
+in0 = spl16;
+in1 = spl17;
+spl16 = 0;
+spl17 = 0;
 
 in_play = 0;
 
@@ -360,6 +362,12 @@ play_state >= 5 && has_group ? (
       );
       pj += 1;
     );
+  );
+
+  // Audio through: pass live mic input to output while recording
+  audio_thru && in_rec_ext ? (
+    spl0 += in0;
+    spl1 += in1;
   );
 );
 

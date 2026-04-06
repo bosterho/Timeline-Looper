@@ -80,7 +80,9 @@ local POST_ROLL = 0.05
 local last_play_state = reaper.GetPlayState()
 local was_recording = false
 local export_enabled = true
+local audio_through = false
 local was_mouse_down = false
+local last_play_pos = 0
 
 -- Per-track data: keyed by track pointer
 --   .groups = ordered list of { rec_item, play_items={}, track }
@@ -273,10 +275,9 @@ local function ensure_mic_track()
   end
 
   if mic_track then
-    -- Ensure Input JSFX is on the track (may have been removed on cleanup)
-    if find_input_jsfx(mic_track) < 0 then
-      reaper.TrackFX_AddByName(mic_track, INPUT_JSFX_NAME, false, -1)
-    end
+    -- Clean up old Input JSFX (no longer needed — sends route audio on ch 17/18 instead)
+    local old_fx = find_input_jsfx(mic_track)
+    if old_fx >= 0 then reaper.TrackFX_Delete(mic_track, old_fx) end
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2)
@@ -291,10 +292,6 @@ local function ensure_mic_track()
   mic_track = reaper.GetTrack(0, 0)
   reaper.GetSetMediaTrackInfo_String(mic_track, "P_NAME", "Mic", true)
   reaper.SetMediaTrackInfo_Value(mic_track, "I_CUSTOMCOLOR", reaper.ColorToNative(0xDE, 0x83, 0x83) | 0x1000000)
-  local fx_idx = reaper.TrackFX_AddByName(mic_track, INPUT_JSFX_NAME, false, -1)
-  if fx_idx < 0 then
-    reaper.ShowMessageBox("Could not add Timeline Looper Input JSFX", SCRIPT_NAME, 0)
-  end
   reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 1)
   reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 1)
   reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMODE", 2)
@@ -310,15 +307,32 @@ local function ensure_mic_track()
   return mic_track
 end
 
+local MIC_SEND_DST_CH = 16 -- 0-indexed: routes mic audio to channels 17/18 on JSFX tracks
+
+local function remove_all_mic_sends()
+  if not mic_track or not reaper.ValidatePtr(mic_track, "MediaTrack*") then return end
+  for i = reaper.GetTrackNumSends(mic_track, 0) - 1, 0, -1 do
+    reaper.RemoveTrackSend(mic_track, 0, i)
+  end
+end
+
+local function ensure_mic_send(track)
+  if not mic_track or not reaper.ValidatePtr(mic_track, "MediaTrack*") then return end
+  if reaper.GetTrackNumSends(track, -1) > 0 then return end
+  local send_idx = reaper.CreateTrackSend(mic_track, track)
+  if send_idx >= 0 then
+    reaper.SetTrackSendInfo_Value(mic_track, 0, send_idx, "I_DSTCHAN", MIC_SEND_DST_CH)
+  end
+end
+
 local function cleanup_mic_track()
   if mic_track and reaper.ValidatePtr(mic_track, "MediaTrack*") then
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECARM", 0)
     reaper.SetMediaTrackInfo_Value(mic_track, "I_RECMON", 0)
-    -- Remove the Input JSFX
+    remove_all_mic_sends()
+    -- Clean up old Input JSFX if present
     local fx = find_input_jsfx(mic_track)
-    if fx >= 0 then
-      reaper.TrackFX_Delete(mic_track, fx)
-    end
+    if fx >= 0 then reaper.TrackFX_Delete(mic_track, fx) end
   end
   mic_track = nil
 end
@@ -606,6 +620,7 @@ local function remove_all_jsfx()
   end
   jsfx_managed = {}
   fx_container_state = {}
+  remove_all_mic_sends()
   reaper.PreventUIRefresh(-1)
 end
 
@@ -627,7 +642,7 @@ local function sync_fx_container(track, play_items)
   local track_idx = reaper.GetMediaTrackInfo_Value(track, "IP_TRACKNUMBER") - 1
   if not play_items or #play_items == 0 then
     remove_mirrored_fx(track)
-    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 18)
     reaper.gmem_write(950 + track_idx, 0)
     return
   end
@@ -640,7 +655,7 @@ local function sync_fx_container(track, play_items)
 
   if not any_fx then
     remove_mirrored_fx(track)
-    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 2)
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 18)
     reaper.gmem_write(950 + track_idx, 0)
     return
   end
@@ -673,7 +688,7 @@ local function sync_fx_container(track, play_items)
   end
 
   -- Rebuild: remove old mirrored FX, re-add
-  reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 16)
+  reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 18)
   remove_mirrored_fx(track)
 
   state = { chain_fingerprints = {}, chain_enabled = {}, slot_fx_indices = {}, needs_sync = true }
@@ -816,7 +831,7 @@ local function ensure_jsfx_on_tracks()
       local fx_idx = reaper.TrackFX_AddByName(track, JSFX_ADD_NAME, false, 0)
       local is_new = fx_idx < 0
       if is_new then
-        fx_idx = reaper.TrackFX_AddByName(track, JSFX_ADD_NAME, false, -1)
+        fx_idx = reaper.TrackFX_AddByName(track, JSFX_ADD_NAME, false, -1000)
       end
       if fx_idx >= 0 then
         if fx_idx > 0 then
@@ -841,18 +856,24 @@ local function ensure_jsfx_on_tracks()
       end
       jsfx_managed[track] = true
     end
+    ensure_mic_send(track)
+    reaper.SetMediaTrackInfo_Value(track, "I_NCHAN", 18) -- need ch 17/18 for mic input
     -- Disarm JSFX tracks (mic track handles all input)
     reaper.SetMediaTrackInfo_Value(track, "I_RECARM", 0)
-    -- Disable anticipative FX so track processes in sync with mic track's gmem writes
+    -- Disable anticipative FX so track processes in sync with mic track
     local perf = reaper.GetMediaTrackInfo_Value(track, "I_PERFFLAGS")
     reaper.SetMediaTrackInfo_Value(track, "I_PERFFLAGS", perf | 2)
   end
   reaper.PreventUIRefresh(-1)
+  -- Close any floating FX windows that REAPER auto-opened
+  local close_cmd = reaper.NamedCommandLookup("_S&M_WNCLS3")
+  if close_cmd > 0 then reaper.Main_OnCommand(close_cmd, 0) end
 end
 
 -- ─── gmem sync (Lua → JSFX) ─────────────────────────────────────────────────
 
 local function write_gmem()
+  reaper.gmem_write(2, audio_through and 1 or 0)
   for track, td in pairs(track_data) do
     local rec_group = td.groups[td.current]
     if not rec_group then goto continue end
@@ -1533,8 +1554,6 @@ local function looper_tick()
         update_fx_bypass(track, active_clips)
       end
     end
-    reaper.defer(looper_tick)
-    return
   end
 
   local play_state = reaper.GetPlayState()
@@ -1583,6 +1602,7 @@ local function looper_tick()
   -- During playback: advance groups and trigger exports
   if play_state > 0 then
     local pos = reaper.GetPlayPosition()
+    last_play_pos = pos
     reaper.Undo_BeginBlock()
     for track, td in pairs(track_data) do
       if is_track_silenced(track) then goto next_track end
@@ -1591,10 +1611,10 @@ local function looper_tick()
       local group = td.groups[td.current]
       if not group then goto next_track end
 
-      -- Clear old audio before playhead reaches rec region pre-roll
+      -- Clear old audio before playhead reaches rec region pre-roll (only when recording)
       -- Extra 0.2s margin ensures items are gone before the audio engine renders them
       -- Skip if rec item is muted (no new recording will replace old audio)
-      if not td.cleared then
+      if not td.cleared and is_recording then
         local rec_start = get_item_pos(group.rec_item)
         if pos >= rec_start - PRE_ROLL - 0.2 then
           local rec_end = rec_start + get_item_len(group.rec_item)
@@ -1739,7 +1759,7 @@ local function looper_tick()
 
       -- Export current rec group if not already exported and rec is active
       local group = td.groups[td.current]
-      if group and td.rec_complete and not td.rec_exported and not td.group_exports[td.current] and not is_item_muted(group.rec_item) then
+      if group and not td.rec_exported and not td.group_exports[td.current] and not is_item_muted(group.rec_item) then
         local buf_len = reaper.gmem_read(100 + track_idx)
         if buf_len > 0 then
           queue_export(group, track, td.current, td.rec_buf)
@@ -1753,7 +1773,7 @@ local function looper_tick()
 
   write_gmem()
 
-  -- Place all remaining exported items when stopped
+  -- Place exported items that were in progress when transport stopped
   if play_state == 0 then
     local any_placed = false
     for track, td in pairs(track_data) do
@@ -1767,9 +1787,13 @@ local function looper_tick()
           end
           for pi, play_item in ipairs(g.play_items) do
             if not ge.plays_placed[pi] then
-              if not any_placed then reaper.PreventUIRefresh(1); any_placed = true end
-              place_play_item_audio(ge.audio_track, play_item, ge.ep)
-              ge.plays_placed[pi] = true
+              -- Only place clips the playhead had entered before stopping
+              local play_start = get_item_pos(play_item)
+              if last_play_pos >= play_start - PRE_ROLL then
+                if not any_placed then reaper.PreventUIRefresh(1); any_placed = true end
+                place_play_item_audio(ge.audio_track, play_item, ge.ep)
+                ge.plays_placed[pi] = true
+              end
             end
           end
         end
@@ -1824,7 +1848,7 @@ local function imgui_loop()
   end
 
   reaper.ImGui_PushFont(ctx, font)
-  reaper.ImGui_SetNextWindowSize(ctx, 280, 75, reaper.ImGui_Cond_Always())
+  reaper.ImGui_SetNextWindowSize(ctx, 380, 75, reaper.ImGui_Cond_Always())
   local visible, open = reaper.ImGui_Begin(ctx, SCRIPT_NAME, true,
     reaper.ImGui_WindowFlags_NoFocusOnAppearing() | reaper.ImGui_WindowFlags_NoResize() | reaper.ImGui_WindowFlags_NoNav())
 
@@ -1847,6 +1871,7 @@ local function imgui_loop()
       remove_all_jsfx()
       relocate_stray_clips()
       scan_all_tracks()
+      ensure_mic_track()
       ensure_jsfx_on_tracks()
     end
     if reaper.ImGui_IsItemHovered(ctx) then
@@ -1857,6 +1882,12 @@ local function imgui_loop()
     if changed then export_enabled = val end
     if reaper.ImGui_IsItemHovered(ctx) then
       reaper.ImGui_SetTooltip(ctx, "This will put audio items onto the track below, so you can rearrange them after recording")
+    end
+    reaper.ImGui_SameLine(ctx)
+    local at_changed, at_val = reaper.ImGui_Checkbox(ctx, "Audio thru", audio_through)
+    if at_changed then audio_through = at_val end
+    if reaper.ImGui_IsItemHovered(ctx) then
+      reaper.ImGui_SetTooltip(ctx, "Pass live mic input to output during recording (hear yourself through the track)")
     end
 
     -- Forward keyboard shortcuts to REAPER when window has focus

@@ -1198,7 +1198,8 @@ local function place_single_item(audio_track, position, length, ep, is_reverse, 
   local xfade = eff_pre + eff_post
   reaper.SetMediaItemInfo_Value(new_item, "D_FADEINLEN", xfade)
   reaper.SetMediaItemInfo_Value(new_item, "D_FADEOUTLEN", xfade)
-  reaper.SetMediaItemInfo_Value(new_item, "D_SNAPOFFSET", eff_pre)
+  -- Reversed: the post-roll plays first, so it's the lead-in before the loop start
+  reaper.SetMediaItemInfo_Value(new_item, "D_SNAPOFFSET", is_reverse and eff_post or eff_pre)
   if is_reverse then
     if reaper.BR_SetMediaSourceProperties then
       -- Reverse via SWS API: silent, so it doesn't create its own undo point.
@@ -1245,6 +1246,11 @@ local function place_play_item_audio(audio_track, play_item, ep)
   local eff_rec = ep.rec_len / playrate
   local eff_pre = ep.actual_pre / playrate
   local eff_post = ep.actual_post / playrate
+  -- Reversed items play the post-roll first and the pre-roll last, so the
+  -- lead-in before each loop boundary is the post-roll (usually longer than
+  -- the pre-roll, since recording runs past the crossfade to cover latency)
+  local lead = is_reverse and eff_post or eff_pre
+  local tail = is_reverse and eff_pre or eff_post
 
   local ratio = play_len / eff_rec
   local n_copies = math.ceil(ratio - 1e-9)
@@ -1253,8 +1259,8 @@ local function place_play_item_audio(audio_track, play_item, ep)
     local grid_pos = play_pos + c * eff_rec
     local remaining = play_end - grid_pos
     local copy_main = math.min(eff_rec, remaining)
-    local item_pos = grid_pos - eff_pre
-    local item_len = copy_main + eff_pre + eff_post
+    local item_pos = grid_pos - lead
+    local item_len = copy_main + lead + tail
     local item
     if is_reverse and copy_main < eff_rec then
       -- Create at full length so reverse operates on full source, then trim
@@ -1264,9 +1270,9 @@ local function place_play_item_audio(audio_track, play_item, ep)
     else
       item = place_single_item(audio_track, item_pos, item_len, ep, is_reverse, playrate)
     end
-    -- Last copy has nothing after it — fade-out only covers the post-roll
+    -- Last copy has nothing after it — fade-out only covers the tail
     if c == n_copies - 1 then
-      reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", eff_post)
+      reaper.SetMediaItemInfo_Value(item, "D_FADEOUTLEN", tail)
     end
     items[#items + 1] = item
   end
@@ -1286,7 +1292,7 @@ local function place_play_item_audio(audio_track, play_item, ep)
   local src_take = reaper.GetActiveTake(play_item)
   local src_fx_count = src_take and reaper.TakeFX_GetCount(src_take) or 0
   for ci, item in ipairs(items) do
-    local src_offset = (ci - 1) * eff_rec - eff_pre
+    local src_offset = (ci - 1) * eff_rec - lead
     local dst_length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
     copy_item_envelopes(play_item, item, src_offset, dst_length)
     -- Copy take FX chain and their parameter envelopes (sliced per loop copy)

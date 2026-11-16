@@ -10,7 +10,8 @@
       "WebFetch(domain:forums.cockos.com)",
       "WebFetch(domain:forum.cockos.com)",
       "WebFetch(domain:www.kvraudio.com)",
-      "WebFetch(domain:recording.de)"
+      "WebFetch(domain:recording.de)",
+      "Bash(wc -l *.lua *.jsfx)"
     ],
     "additionalDirectories": [
       "c:\\Users\\ben\\AppData\\Roaming\\REAPER\\Effects"

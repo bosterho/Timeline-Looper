@@ -84,6 +84,13 @@ local audio_through = false
 local was_mouse_down = false
 local last_play_pos = 0
 
+-- Undo consolidation: edits made by the defer loop are done silently (no
+-- per-tick undo blocks) and committed as ONE undo point once the transport
+-- has stopped and all pending exports/placements are finished.
+local UNDO_DESC = "Timeline Looper: update loops"
+local undo_dirty = false
+local function mark_undo_dirty() undo_dirty = true end
+
 -- Per-track data: keyed by track pointer
 --   .groups = ordered list of { rec_item, play_items={}, track }
 --   .current = index into .groups (the group currently written to gmem)
@@ -1015,7 +1022,10 @@ local function clear_group_audio(group)
     end
   end
   reaper.PreventUIRefresh(-1)
-  if changed then reaper.UpdateArrange() end
+  if changed then
+    mark_undo_dirty()
+    reaper.UpdateArrange()
+  end
 end
 
 
@@ -1168,6 +1178,7 @@ end
 
 local function place_single_item(audio_track, position, length, ep, is_reverse, playrate)
   playrate = playrate or 1.0
+  mark_undo_dirty()
   local new_item = reaper.AddMediaItemToTrack(audio_track)
   local new_take = reaper.AddTakeToMediaItem(new_item)
   local new_source = reaper.PCM_Source_CreateFromFile(ep.file)
@@ -1189,9 +1200,23 @@ local function place_single_item(audio_track, position, length, ep, is_reverse, 
   reaper.SetMediaItemInfo_Value(new_item, "D_FADEOUTLEN", xfade)
   reaper.SetMediaItemInfo_Value(new_item, "D_SNAPOFFSET", eff_pre)
   if is_reverse then
-    reaper.SetMediaItemSelected(new_item, true)
-    reaper.Main_OnCommand(41051, 0) -- Toggle take reverse
-    reaper.SetMediaItemSelected(new_item, false)
+    if reaper.BR_SetMediaSourceProperties then
+      -- Reverse via SWS API: silent, so it doesn't create its own undo point.
+      -- Then mirror the start offset the way "Toggle take reverse" does, so the
+      -- same audio segment plays backwards: offs' = src_len - offs - len*rate
+      -- Read length first: SWS swaps the take's source, so new_source may not
+      -- stay valid after the call
+      local src_len = reaper.GetMediaSourceLength(new_source)
+      reaper.BR_SetMediaSourceProperties(new_take, false, 0, 0, 0, true)
+      local offs = ep.src_offset or 0
+      reaper.SetMediaItemTakeInfo_Value(new_take, "D_STARTOFFS",
+        math.max(0, src_len - offs - length * playrate))
+    else
+      -- Fallback without SWS (creates a "Toggle take reverse" undo point)
+      reaper.SetMediaItemSelected(new_item, true)
+      reaper.Main_OnCommand(41051, 0) -- Toggle take reverse
+      reaper.SetMediaItemSelected(new_item, false)
+    end
   end
   return new_item
 end
@@ -1338,7 +1363,6 @@ local function process_export()
       saved_edit_cursor = reaper.GetCursorPosition()
     end
     set_track_xfade(next_exp.group.track)
-    reaper.Undo_BeginBlock()
     clear_group_audio(next_exp.group)
     -- Clean up leftover JSFX export items in this group's range on the control track
     local cleanup_start = next_exp.rec_start - PRE_ROLL
@@ -1350,10 +1374,10 @@ local function process_export()
         local it_pos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
         if it_pos >= cleanup_start and it_pos < cleanup_end then
           reaper.DeleteTrackMediaItem(next_exp.group.track, it)
+          mark_undo_dirty()
         end
       end
     end
-    reaper.Undo_EndBlock("Timeline Looper: clear audio", -1)
     local audio_track = find_audio_sibling(next_exp.group.track)
     reaper.SetEditCurPos(next_exp.rec_start, false, false)
     reaper.gmem_write(600 + next_exp.track_idx, next_exp.export_buf)
@@ -1416,6 +1440,7 @@ local function process_export()
         local source = take and reaper.GetMediaItemTake_Source(take)
         local src_filename = source and reaper.GetMediaSourceFileName(source, "")
         reaper.DeleteTrackMediaItem(item_track, item)
+        mark_undo_dirty()
         if src_filename and src_filename ~= "" then
           -- Save export params for incremental placement
           local td = track_data[pe.track or pe.group.track]
@@ -1603,7 +1628,6 @@ local function looper_tick()
   if play_state > 0 then
     local pos = reaper.GetPlayPosition()
     last_play_pos = pos
-    reaper.Undo_BeginBlock()
     for track, td in pairs(track_data) do
       if is_track_silenced(track) then goto next_track end
       set_track_xfade(track)
@@ -1741,7 +1765,6 @@ local function looper_tick()
 
       ::next_track::
     end
-    reaper.Undo_EndBlock("Timeline Looper: clear audio", -1)
   end
 
   -- Auto-export when transport stops
@@ -1803,6 +1826,12 @@ local function looper_tick()
       reaper.PreventUIRefresh(-1)
       reaper.UpdateArrange()
     end
+  end
+
+  -- Commit all of this pass's edits as a single undo point once idle
+  if undo_dirty and play_state == 0 and not pending_export and #export_queue == 0 then
+    reaper.Undo_OnStateChange(UNDO_DESC)
+    undo_dirty = false
   end
 
   reaper.defer(looper_tick)
@@ -1924,10 +1953,15 @@ end
 
 reaper.atexit(function()
   uninstall_startup()
+  -- Any uncommitted loop edits are folded into this exit undo point
+  undo_dirty = false
+  reaper.Undo_BeginBlock()
   restore_track_state()
   remove_all_jsfx()
+  reaper.Undo_EndBlock("Timeline Looper: stop", -1)
 end)
 
+reaper.Undo_BeginBlock()
 reaper.PreventUIRefresh(1)
 remove_all_jsfx()
 relocate_stray_clips()
@@ -1950,6 +1984,7 @@ ensure_mic_track()
 ensure_jsfx_on_tracks()
 reaper.PreventUIRefresh(-1)
 reaper.UpdateArrange()
+reaper.Undo_EndBlock("Timeline Looper: start", -1)
 install_startup()
 reaper.defer(looper_tick)
 reaper.defer(imgui_loop)

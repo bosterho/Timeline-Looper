@@ -259,7 +259,9 @@ play_state >= 5 && has_group ? (
             );
             bp0 = floor(bp_f);
             frac = bp_f - bp0;
-            bp1 = p_reverse ? bp0 - 1 : bp0 + 1;
+            // Always interpolate toward bp0+1: bp_f = bp0 + frac regardless of
+            // play direction (reverse only changes how bp_f moves over time)
+            bp1 = bp0 + 1;
 
             bp0 >= 0 && bp0 < ptotal ? (
               // Crossfade gain in timeline time (not buffer time)

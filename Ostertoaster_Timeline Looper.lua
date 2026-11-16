@@ -866,8 +866,8 @@ local function ensure_jsfx_on_tracks()
   end
   reaper.PreventUIRefresh(-1)
   -- Close any floating FX windows that REAPER auto-opened
-  local close_cmd = reaper.NamedCommandLookup("_S&M_WNCLS3")
-  if close_cmd > 0 then reaper.Main_OnCommand(close_cmd, 0) end
+  -- local close_cmd = reaper.NamedCommandLookup("_S&M_WNCLS3")
+  -- if close_cmd > 0 then reaper.Main_OnCommand(close_cmd, 0) end
 end
 
 -- ─── gmem sync (Lua → JSFX) ─────────────────────────────────────────────────
@@ -1836,19 +1836,19 @@ end
 -- ─── ImGui interface ─────────────────────────────────────────────────────────
 
 local ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
-local font = reaper.ImGui_CreateFont("sans-serif", 14)
+local font = reaper.ImGui_CreateFont("sans-serif")
 reaper.ImGui_Attach(ctx, font)
 
 local function imgui_loop()
   -- Recreate context if it expired
   if not reaper.ImGui_ValidatePtr(ctx, 'ImGui_Context*') then
     ctx = reaper.ImGui_CreateContext(SCRIPT_NAME)
-    font = reaper.ImGui_CreateFont("sans-serif", 14)
+    font = reaper.ImGui_CreateFont("sans-serif")
     reaper.ImGui_Attach(ctx, font)
   end
 
-  reaper.ImGui_PushFont(ctx, font)
-  reaper.ImGui_SetNextWindowSize(ctx, 380, 75, reaper.ImGui_Cond_Always())
+  reaper.ImGui_PushFont(ctx, font, 14)
+  reaper.ImGui_SetNextWindowSize(ctx, 380, 90, reaper.ImGui_Cond_Always())
   local visible, open = reaper.ImGui_Begin(ctx, SCRIPT_NAME, true,
     reaper.ImGui_WindowFlags_NoFocusOnAppearing() | reaper.ImGui_WindowFlags_NoResize() | reaper.ImGui_WindowFlags_NoNav())
 
